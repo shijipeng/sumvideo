@@ -1,0 +1,122 @@
+@import "tailwindcss";
+
+/* 首屏默认（与 dark 一致），避免刷新时 data-theme 未就绪导致白屏 */
+:root {
+  color-scheme: dark;
+  --sv-bg: #0d1117;
+  --sv-canvas: #161b22;
+  --sv-canvas-subtle: #21262d;
+  --sv-border: #30363d;
+  --sv-fg: #e6edf3;
+  --sv-fg-muted: #8b949e;
+  --sv-accent: #2f81f7;
+  --sv-accent-fg: #ffffff;
+  --sv-danger-bg: rgba(248, 81, 73, 0.15);
+  --sv-danger-fg: #ff7b72;
+  --sv-overlay: rgba(1, 4, 9, 0.6);
+}
+
+/* GitHub-inspired themes */
+[data-theme="dark"] {
+  color-scheme: dark;
+  --sv-bg: #0d1117;
+  --sv-canvas: #161b22;
+  --sv-canvas-subtle: #21262d;
+  --sv-border: #30363d;
+  --sv-fg: #e6edf3;
+  --sv-fg-muted: #8b949e;
+  --sv-accent: #2f81f7;
+  --sv-accent-fg: #ffffff;
+  --sv-danger-bg: rgba(248, 81, 73, 0.15);
+  --sv-danger-fg: #ff7b72;
+  --sv-overlay: rgba(1, 4, 9, 0.6);
+}
+
+[data-theme="light"] {
+  color-scheme: light;
+  --sv-bg: #ffffff;
+  --sv-canvas: #f6f8fa;
+  --sv-canvas-subtle: #eaeef2;
+  --sv-border: #d0d7de;
+  --sv-fg: #1f2328;
+  --sv-fg-muted: #656d76;
+  --sv-accent: #0969da;
+  --sv-accent-fg: #ffffff;
+  --sv-danger-bg: #ffebe9;
+  --sv-danger-fg: #cf222e;
+  --sv-overlay: rgba(31, 35, 40, 0.4);
+}
+
+:root {
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+  overflow: hidden;
+}
+
+body {
+  background: var(--sv-bg);
+  color: var(--sv-fg);
+}
+
+#root {
+  height: 100dvh;
+  max-height: 100dvh;
+  overflow: hidden;
+}
+
+/* 固定视口高度，内部 flex 子项才能正确出现滚动条 */
+.sv-app-shell {
+  display: flex;
+  flex-direction: column;
+  height: 100dvh;
+  max-height: 100dvh;
+  overflow: hidden;
+}
+
+.sv-notes-scroll {
+  flex: 1 1 0;
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
+}
+
+.sv-mindmap .markmap-foreign {
+  cursor: pointer;
+}
+
+/* Markmap 内置样式默认浅底深字；深色主题下覆盖 CSS 变量 */
+[data-theme="dark"] .sv-mindmap svg.markmap,
+:root:not([data-theme="light"]) .sv-mindmap svg.markmap {
+  --markmap-text-color: var(--sv-fg);
+  --markmap-circle-open-bg: var(--sv-canvas-subtle);
+  --markmap-code-bg: var(--sv-canvas-subtle);
+  --markmap-code-color: var(--sv-fg);
+  --markmap-a-color: #58a6ff;
+  --markmap-a-hover-color: #79c0ff;
+  --markmap-highlight-bg: rgba(187, 128, 9, 0.35);
+  --markmap-highlight-node-bg: rgba(47, 129, 247, 0.2);
+  color: var(--markmap-text-color);
+}
+
+[data-theme="light"] .sv-mindmap svg.markmap {
+  --markmap-text-color: var(--sv-fg);
+  --markmap-circle-open-bg: #ffffff;
+  --markmap-code-bg: var(--sv-canvas-subtle);
+  --markmap-code-color: var(--sv-fg);
+  --markmap-a-color: var(--sv-accent);
+  --markmap-a-hover-color: #0550ae;
+  color: var(--markmap-text-color);
+}
+
+[data-theme="dark"] .sv-mindmap .markmap-foreign div,
+:root:not([data-theme="light"]) .sv-mindmap .markmap-foreign div,
+[data-theme="light"] .sv-mindmap .markmap-foreign div {
+  color: var(--markmap-text-color);
+}

@@ -1,0 +1,9 @@
+{
+  "name": "sumvideo",
+  "private": true,
+  "description": "SumVideo 根目录快捷命令",
+  "scripts": {
+    "backend": "bash scripts/start-backend.sh",
+    "frontend": "npm run dev --prefix web"
+  }
+}

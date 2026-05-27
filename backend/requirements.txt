@@ -1,0 +1,8 @@
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+python-multipart>=0.0.12
+openai>=1.55.0
+mlx-whisper>=0.4.0
+faster-whisper>=1.1.0
+huggingface_hub>=0.26.0
+ffmpeg-python>=0.2.0
