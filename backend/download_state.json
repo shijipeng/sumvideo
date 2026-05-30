@@ -1,0 +1,9 @@
+{
+  "status": "error",
+  "progress": 1,
+  "message": "正在下载 Download complete:…",
+  "model_id": "mlx-community/whisper-small-mlx",
+  "error": "超过 90 秒无新数据。若使用代理（如 Clash 7897），请确认 huggingface.co 可访问，或暂时关闭系统代理后点击「开始下载」重试。",
+  "bytes_updated_at": 1779983954.451828,
+  "started_at": 1779983798.568769
+}

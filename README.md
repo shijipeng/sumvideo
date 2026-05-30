@@ -22,7 +22,7 @@ sumvideo/
 | Node.js 20+ | 前端（项目使用 Vite 5，兼容 20.17） | `node --version` |
 | ffmpeg | 从视频提取音频 | `ffmpeg -version` |
 
-> **Whisper 转写**：Mac M 系列用 **mlx-whisper**；Windows / Linux / Intel Mac 用 **faster-whisper**。模型下载到 **`backend/models/`**（已 gitignore，不会进仓库；不会写到 `~/.cache`）。
+> **Whisper 转写**：Mac M 系列用 **mlx-whisper**（默认 **Medium MLX**）；Windows / Linux / Intel Mac 用 **faster-whisper**（默认 **medium**）。模型下载到用户数据目录下的 **`models/`**（Web 开发时默认为 `backend/models/`，已 gitignore）。
 
 ## 快速启动（联调用 dev，无需 build）
 
@@ -71,7 +71,7 @@ npm install
 2. 选择 **Whisper 转写模型**（本机 MLX，首次使用会下载模型）
 3. 选择 **DeepSeek 总结模型**
 
-保存后会进入 **模型下载页**（仅针对你刚选的 Whisper 模型，可点「开始下载」；默认从 **hf-mirror.com** 下载，需官网时可设置 `HF_ENDPOINT=https://huggingface.co`）。下载完成后才进入主界面。配置保存在 `backend/.local/settings.json`（权限 600），不会进入 Git。
+保存后会进入 **模型下载页**（仅针对你刚选的 Whisper 模型，可点「开始下载」；默认从 **hf-mirror.com** 下载，需官网时可设置 `HF_ENDPOINT=https://huggingface.co`）。下载完成后才进入主界面。配置保存在用户数据目录的 **`settings.json`**（Web 开发时位于 `backend/settings.json` 或从旧版 `.local` 自动迁移，权限 600），不会进入 Git。
 
 可选环境变量（高级用户）：`DEEPSEEK_API_KEY`、`WHISPER_MODEL`
 
@@ -83,12 +83,19 @@ npm install
 4. 点击章节可跳转播放；播放时自动高亮当前章节
 5. 支持导出 `summary.md`、历史记录与重复视频提示
 
+## 桌面端
+
+Electron 应用、与 Web 统一的上传与播放流程、内嵌 Python 构建说明见 **[DESKTOP.md](./DESKTOP.md)**。
+
+开发：`npm run desktop:dev`（需同时或预先启动 Web 后端与 `npm run frontend`）。
+
 ## API
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| POST | `/api/upload?force=true` | 上传视频 |
+| POST | `/api/upload?force=true` | 上传视频（Web 与桌面统一） |
+| POST | `/api/process-path` | 已废弃（410），请使用 `/api/upload` |
 | GET | `/api/status/{id}` | 查询进度与结果 |
 | GET | `/api/history` | 历史列表 |
 | DELETE | `/api/history/{id}` | 删除记录 |
-| POST | `/api/retry/{id}` | 重新处理（需视频文件仍在 uploads/） |
+| POST | `/api/retry/{id}` | 重新处理（uploads 副本或 source_path 原文件须存在） |

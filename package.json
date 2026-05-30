@@ -1,9 +1,21 @@
 {
   "name": "sumvideo",
+  "version": "0.2.0",
   "private": true,
   "description": "SumVideo 根目录快捷命令",
+  "type": "module",
+  "main": "electron/main.mjs",
   "scripts": {
     "backend": "bash scripts/start-backend.sh",
-    "frontend": "npm run dev --prefix web"
+    "backend:dev": "SUMVIDEO_RELOAD=1 bash scripts/start-backend.sh",
+    "frontend": "bash scripts/start-frontend.sh",
+    "build:web": "npm run build --prefix web",
+    "desktop:dev": "SUMVIDEO_ENV=dev SUMVIDEO_DEV=1 electron .",
+    "desktop:build": "bash scripts/build-desktop-mac.sh",
+    "desktop:build:mac": "bash scripts/build-desktop-mac.sh"
+  },
+  "devDependencies": {
+    "electron": "^33.2.0",
+    "electron-builder": "^25.1.8"
   }
 }

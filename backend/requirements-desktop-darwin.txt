@@ -1,0 +1,2 @@
+-r requirements.txt
+# Apple Silicon 桌面包：仅 MLX 栈（构建 venv 时可省略 faster-whisper 以减小体积，开发环境保留无妨）

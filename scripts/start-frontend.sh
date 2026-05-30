@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -e
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck source=scripts/load-env.sh
+source "$ROOT/scripts/load-env.sh"
 cd "$ROOT/web"
 
 if [ ! -d "node_modules" ]; then
@@ -9,4 +11,5 @@ if [ ! -d "node_modules" ]; then
   exit 1
 fi
 
+echo "SumVideo 前端 [${SUMVIDEO_ENV}] → ${SUMVIDEO_FRONTEND_URL}（API 代理 → ${SUMVIDEO_BACKEND_URL}）"
 exec npm run dev

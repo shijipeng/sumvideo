@@ -10,16 +10,25 @@ from pathlib import Path
 import config
 from db.database import (
     delete_video,
+    get_video,
     hashes_with_duplicates,
     list_all_video_ids,
     list_ids_by_hash,
     list_video_ids_by_status,
+    mark_processing_stale_as_error,
     mark_tasks_stale_as_error,
 )
 
+
+def has_source_path_record(video_id: str) -> bool:
+    video = get_video(video_id)
+    if not video:
+        return False
+    return bool((video.get("source_path") or "").strip())
+
 logger = logging.getLogger(__name__)
 
-UPLOAD_DIR = Path(config.UPLOAD_DIR)
+from core.paths import upload_dir as get_upload_dir
 
 VIDEO_EXTENSIONS = (
     ".mp4", ".avi", ".mov", ".mkv", ".webm", ".flv", ".wmv",
@@ -28,19 +37,33 @@ VIDEO_EXTENSIONS = (
 
 # 卡在 pending/processing 超过此时长视为僵尸任务
 STALE_TASK_HOURS = int(getattr(config, "STALE_TASK_HOURS", 48))
+STALE_PROCESSING_MINUTES = int(getattr(config, "STALE_PROCESSING_MINUTES", 15))
 
 
-def find_video_path(video_id: str) -> Path | None:
+def _upload_dir() -> Path:
+    return get_upload_dir()
+
+
+def find_upload_video_path(video_id: str) -> Path | None:
+    """仅在 uploads 目录查找（Web 上传副本）。"""
+    upload = _upload_dir()
     for ext in VIDEO_EXTENSIONS:
-        path = UPLOAD_DIR / f"{video_id}{ext}"
+        path = upload / f"{video_id}{ext}"
         if path.is_file():
             return path
     return None
 
 
+def find_video_path(video_id: str) -> Path | None:
+    """兼容旧名：仅 uploads。"""
+    return find_upload_video_path(video_id)
+
+
 def delete_video_file(video_id: str) -> bool:
-    """仅删除磁盘上的视频文件，保留数据库记录。"""
-    path = find_video_path(video_id)
+    """仅删除 uploads 中的视频副本，不删用户 source_path 原文件。"""
+    if has_source_path_record(video_id):
+        return False
+    path = find_upload_video_path(video_id)
     if path is None:
         return False
     try:
@@ -53,7 +76,7 @@ def delete_video_file(video_id: str) -> bool:
 
 
 def purge_video_record(video_id: str) -> None:
-    """删除视频文件 + 数据库记录（用户删历史、去重弃用记录）。"""
+    """删除 uploads 副本（若有）+ 数据库记录；不删用户原文件。"""
     delete_video_file(video_id)
     delete_video(video_id)
 
@@ -82,8 +105,25 @@ def purge_files_for_failed_tasks() -> int:
     return count
 
 
+def purge_stale_processing_tasks() -> int:
+    """processing 长时间无心跳（如 uvicorn --reload 杀后台任务）→ error。"""
+    stale_ids = mark_processing_stale_as_error(STALE_PROCESSING_MINUTES)
+    count = 0
+    for vid in stale_ids:
+        if delete_video_file(vid):
+            count += 1
+    if stale_ids:
+        logger.info(
+            "中断的 processing 任务: 标记 %s 条为 error，删除 %s 个视频文件",
+            len(stale_ids),
+            count,
+        )
+    return len(stale_ids)
+
+
 def purge_stale_in_progress_tasks() -> int:
     """长时间未完成的 pending/processing：标记为 error 并删除视频文件。"""
+    purge_stale_processing_tasks()
     stale_ids = mark_tasks_stale_as_error(STALE_TASK_HOURS)
     count = 0
     for vid in stale_ids:
@@ -98,10 +138,11 @@ def purge_orphan_and_temp_files() -> int:
     """删除无 DB 记录的视频文件，以及上传中断留下的 temp_* 文件。"""
     known_ids = set(list_all_video_ids())
     removed = 0
-    if not UPLOAD_DIR.is_dir():
+    upload = _upload_dir()
+    if not upload.is_dir():
         return 0
 
-    for path in UPLOAD_DIR.iterdir():
+    for path in upload.iterdir():
         if not path.is_file():
             continue
         name = path.name
@@ -133,7 +174,7 @@ def purge_orphan_and_temp_files() -> int:
 
 def run_storage_cleanup() -> dict[str, int]:
     """启动或维护时执行全套清理，返回各步骤删除数量。"""
-    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    _upload_dir().mkdir(parents=True, exist_ok=True)
     stats = {
         "duplicates": purge_duplicate_records(),
         "failed_files": purge_files_for_failed_tasks(),

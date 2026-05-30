@@ -1,6 +1,14 @@
 """SumVideo FastAPI 后端入口"""
 
-from core.hf_cache import setup_hf_hub_cache
+from core.paths import init_data_paths
+
+init_data_paths()
+
+import config as app_config_module
+
+app_config_module.refresh_path_config()
+
+from core.hf_cache import get_hf_hub_cache_dir, setup_hf_hub_cache
 
 setup_hf_hub_cache()
 
@@ -46,23 +54,29 @@ from core.model_download import (
     is_model_cached,
     start_download,
 )
+from core.paths import get_data_dir
 from core.settings_store import is_settings_ready, is_fully_ready
 from core.storage_cleanup import (
-    find_video_path,
     on_processing_failed,
     purge_video_record,
     run_storage_cleanup,
 )
+from core.video_paths import resolve_video_path
+from core.paths import upload_dir as paths_upload_dir
+from core.task_resume import video_error_message, video_has_resumable_transcript
 from db.database import (
     init_db,
     insert_video,
     update_status,
+    update_transcript_progress,
     update_result,
     update_error,
+    prepare_retry,
     get_video,
     find_by_hash,
     list_ids_by_hash,
     get_all_history,
+    mark_processing_stale_as_error,
 )
 
 app = FastAPI(title="SumVideo", version="0.1.0")
@@ -76,10 +90,10 @@ app.add_middleware(
 )
 
 # 确保存储目录存在
-UPLOAD_DIR = Path(config.UPLOAD_DIR)
+UPLOAD_DIR = paths_upload_dir()
 AUDIO_DIR = Path(config.AUDIO_DIR)
 UPLOAD_DIR.mkdir(exist_ok=True)
-AUDIO_DIR.mkdir(exist_ok=True)
+AUDIO_DIR.mkdir(parents=True, exist_ok=True)
 
 
 VIDEO_EXTENSIONS = [".mp4", ".avi", ".mov", ".mkv", ".webm", ".flv", ".wmv", ".m4v", ".mpeg", ".mpg", ".3gp", ".ts"]
@@ -129,66 +143,151 @@ def compute_file_hash(file_path: str) -> str:
     return sha256.hexdigest()
 
 
-async def process_video(video_id: str, video_path: str, file_ext: str):
-    """后台处理视频：转写 + 总结"""
-    try:
-        update_status(video_id, "processing", 5)
+async def _run_notes_stage(
+    video_id: str,
+    transcript_text: str,
+    whisper_segments: list[dict],
+    loop: asyncio.AbstractEventLoop,
+    notes_timeout: float,
+):
+    """转写完成后或断点续跑：生成笔记并写入结果。"""
+    import logging
 
-        # 步骤 1: 转写
-        def progress_callback(percent: int, message: str = ""):
-            # percent 为转写内部 10–90，与终端帧进度一致，写入数据库供前端轮询
-            progress = min(80, max(5, percent))
-            update_status(video_id, "processing", progress)
+    log = logging.getLogger("sumvideo.process")
 
-        loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(
-            None,
-            lambda: transcribe(video_path, get_whisper_model(), progress_callback),
+    def do_notes():
+        notes_log = logging.getLogger("sumvideo.notes")
+        notes_log.info(
+            "开始 DeepSeek 笔记生成，转写约 %s 字",
+            len(transcript_text),
         )
-
-        transcript_text = result.get("text", "")
-        whisper_segments = normalize_transcript_segments(result.get("segments", []))
-
-        update_status(video_id, "processing", 82)
-
-        def do_notes():
+        try:
             return generate_notes(transcript_text)
+        finally:
+            notes_log.info("DeepSeek 笔记生成结束")
 
-        update_status(video_id, "processing", 88)
-        notes = await loop.run_in_executor(None, do_notes)
-        overview = notes.get("overview", "")
-        sections = notes.get("sections") or []
+    update_status(video_id, "processing", 88)
+    log.info("任务 %s 进入笔记阶段（88%%）", video_id)
+    try:
+        notes = await asyncio.wait_for(
+            loop.run_in_executor(None, do_notes),
+            timeout=notes_timeout,
+        )
+    except asyncio.TimeoutError:
+        raise TimeoutError(
+            f"笔记生成超过 {int(notes_timeout)} 秒仍未完成，请检查网络或稍后重试"
+        ) from None
 
-        if not sections:
-            sections = [
-                {
-                    "title": f"第 {i + 1} 段",
-                    "start_time": round(s["start"], 1),
-                    "end_time": round(s["end"], 1),
-                    "lead": "",
-                    "points": [s.get("text", "").strip()] if s.get("text") else [],
-                }
-                for i, s in enumerate(whisper_segments)
-            ]
+    overview = notes.get("overview", "")
+    sections = notes.get("sections") or []
 
-        update_status(video_id, "processing", 95)
-        update_result(
-            video_id,
-            transcript_text,
-            sections,
-            overview,
-            whisper_segments,
+    if not sections:
+        sections = [
+            {
+                "title": f"第 {i + 1} 段",
+                "start_time": round(s["start_time"], 1),
+                "end_time": round(s["end_time"], 1),
+                "lead": "",
+                "points": [s.get("text", "").strip()] if s.get("text") else [],
+            }
+            for i, s in enumerate(whisper_segments)
+        ]
+
+    update_status(video_id, "processing", 95)
+    update_result(
+        video_id,
+        transcript_text,
+        sections,
+        overview,
+        whisper_segments,
+    )
+
+
+async def process_video(
+    video_id: str,
+    video_path: str,
+    file_ext: str,
+    *,
+    notes_only: bool = False,
+):
+    """后台处理视频：转写 + 总结；notes_only 时跳过 Whisper 仅用已存转写。"""
+    import logging
+
+    log = logging.getLogger("sumvideo.process")
+    loop = asyncio.get_running_loop()
+    notes_timeout = float(getattr(config, "NOTES_STAGE_TIMEOUT_SEC", 360))
+    transcript_saved = False
+
+    try:
+        if notes_only:
+            row = get_video(video_id)
+            if not row or not video_has_resumable_transcript(row):
+                raise ValueError("无已保存的转写，请使用「从头重新处理」")
+            transcript_text = (row.get("transcript") or "").strip()
+            whisper_segments = normalize_transcript_segments(
+                row.get("transcript_segments") or []
+            )
+            transcript_saved = True
+            update_status(video_id, "processing", 82)
+            log.info("任务 %s 断点续跑：跳过转写，直接生成笔记", video_id)
+        else:
+            update_status(video_id, "processing", 5)
+
+            def progress_callback(percent: int, message: str = ""):
+                progress = min(80, max(5, percent))
+
+                def _write():
+                    update_status(video_id, "processing", progress)
+
+                loop.call_soon_threadsafe(_write)
+
+            result = await loop.run_in_executor(
+                None,
+                lambda: transcribe(video_path, get_whisper_model(), progress_callback),
+            )
+
+            transcript_text = result.get("text", "")
+            whisper_segments = normalize_transcript_segments(result.get("segments", []))
+
+            update_transcript_progress(
+                video_id, transcript_text, whisper_segments, progress=82
+            )
+            transcript_saved = True
+
+        await _run_notes_stage(
+            video_id, transcript_text, whisper_segments, loop, notes_timeout
         )
 
+    except BrokenPipeError:
+        error_msg = (
+            "转写进程输出管道中断（常见于后端被管道命令启动）。"
+            "请用 npm run backend 或 scripts/start-backend.sh 重启后端后重试。"
+        )
+        update_error(video_id, error_msg, preserve_transcript=transcript_saved)
+        on_processing_failed(video_id)
     except Exception as e:
         error_msg = str(e)
-        update_error(video_id, error_msg)
+        if "Broken pipe" in error_msg or "BrokenPipeError" in type(e).__name__:
+            error_msg = (
+                "转写输出管道中断。请确保用 npm run backend 启动后端（不要接 | head 等管道），"
+                f"然后重新上传或点「重新处理」。原始信息: {e}"
+            )
+        update_error(video_id, error_msg, preserve_transcript=transcript_saved)
         on_processing_failed(video_id)
 
 
 @app.on_event("startup")
 def startup():
+    import logging
+
     init_db()
+    stale_mins = int(getattr(config, "STALE_PROCESSING_MINUTES", 15))
+    revived = mark_processing_stale_as_error(stale_mins)
+    if revived:
+        logging.getLogger(__name__).warning(
+            "已将 %s 条长时间卡在 processing 的任务标为失败（多为后端热重载中断）",
+            len(revived),
+        )
     run_storage_cleanup()
 
 
@@ -199,6 +298,17 @@ class SettingsBody(BaseModel):
     api_key: str | None = None  # 更新配置时可留空，保留已保存的 Key
     whisper_model: str
     deepseek_model: str = "deepseek-v4-flash"
+
+
+class ProcessPathBody(BaseModel):
+    path: str
+    force: bool = False
+
+
+ALLOWED_VIDEO_EXTENSIONS = {
+    ".mp4", ".avi", ".mov", ".mkv", ".webm", ".flv", ".wmv",
+    ".m4v", ".mpeg", ".mpg", ".3gp", ".ts",
+}
 
 
 @app.get("/api/settings")
@@ -222,6 +332,8 @@ def get_settings():
         "whisper_options": list_options_for_api(),
         "deepseek_options": app_config.DEEPSEEK_MODEL_OPTIONS,
         "model_download_hint": get_download_hint(whisper) if whisper else None,
+        "data_dir": str(get_data_dir()),
+        "models_cache_dir": get_hf_hub_cache_dir(),
     }
 
 
@@ -313,10 +425,31 @@ def models_download_progress():
     """轮询模型下载进度"""
     status = get_download_status()
     whisper = get_whisper_model() if is_settings_ready() else None
+    model_ready = bool(whisper and is_model_cached(whisper))
+
+    if (
+        status.get("status") == "done"
+        and model_ready
+        and status.get("model_id") == whisper
+    ):
+        return {
+            **status,
+            "model_ready": True,
+            "ready": is_fully_ready(),
+        }
+
+    downloading = (
+        status.get("status") == "downloading"
+        and status.get("model_id") == whisper
+    )
+    progress = int(status.get("progress") or 0)
+    if downloading and progress < 95:
+        return {**status, "model_ready": False, "ready": False}
+
     return {
         **status,
-        "model_ready": bool(whisper and is_model_cached(whisper)),
-        "ready": is_fully_ready(),
+        "model_ready": model_ready,
+        "ready": is_fully_ready() if model_ready else False,
     }
 
 
@@ -343,13 +476,9 @@ async def upload_video(
 
     filename = file.filename or "upload.mp4"
     ext = Path(filename).suffix.lower()
-    allowed = {
-        ".mp4", ".avi", ".mov", ".mkv", ".webm", ".flv", ".wmv",
-        ".m4v", ".mpeg", ".mpg", ".3gp", ".ts",
-    }
     if not ext:
         raise HTTPException(400, "无法识别视频格式，请使用带扩展名的文件（如 .mp4 .mov .m4v）")
-    if ext not in allowed:
+    if ext not in ALLOWED_VIDEO_EXTENSIONS:
         raise HTTPException(400, f"不支持的文件格式: {ext}")
 
     # 保存到临时文件
@@ -392,6 +521,15 @@ async def upload_video(
     return {"task_id": video_id, "duplicate": False}
 
 
+@app.post("/api/process-path", deprecated=True)
+async def process_path_video(_body: ProcessPathBody):
+    """已废弃：请使用 POST /api/upload 上传视频到 uploads/。"""
+    raise HTTPException(
+        410,
+        "此接口已废弃。桌面端请通过上传接口将视频复制到 uploads/ 后再处理。",
+    )
+
+
 def _progress_message(progress: float, status: str) -> str:
     if status != "processing":
         return ""
@@ -399,16 +537,22 @@ def _progress_message(progress: float, status: str) -> str:
         return "准备转写…"
     if progress < 82:
         return "正在 Whisper 转写…"
-    if progress < 100:
-        return "正在生成 AI 笔记…"
-    return ""
+    if progress < 95:
+        return "正在生成 AI 笔记（长视频可能需 2–5 分钟，请稍候）…"
+    return "正在保存结果…"
 
 
 @app.get("/api/video/{video_id}")
 async def stream_video(video_id: str):
-    """播放已上传的视频（处理完成后仍保留在 uploads 目录）"""
-    path = find_video_path(video_id)
+    """播放视频：优先 uploads 副本，旧记录可回退 source_path。"""
+    path = resolve_video_path(video_id)
     if path is None:
+        video = get_video(video_id)
+        if video and (video.get("source_path") or "").strip():
+            raise HTTPException(
+                404,
+                "原视频文件已移动或删除，请在桌面重新选择文件",
+            )
         raise HTTPException(404, "视频文件不存在")
     media_type = MEDIA_TYPES.get(path.suffix.lower(), "application/octet-stream")
     return FileResponse(path, media_type=media_type, filename=path.name)
@@ -422,6 +566,8 @@ async def get_status(task_id: str):
         raise HTTPException(404, "任务不存在")
 
     prog = float(video["progress"] or 0)
+    err = video_error_message(video)
+    resume = video["status"] == "error" and video_has_resumable_transcript(video)
     return {
         "id": video["id"],
         "filename": video["filename"],
@@ -432,8 +578,11 @@ async def get_status(task_id: str):
         "transcript_segments": video.get("transcript_segments"),
         "chapters": video.get("chapters"),
         "summary": video.get("summary"),
+        "error_message": err,
+        "resume_available": resume,
         "created_at": video["created_at"],
         "updated_at": video.get("updated_at"),
+        "source_path": video.get("source_path"),
     }
 
 
@@ -455,26 +604,71 @@ async def delete_history(video_id: str):
 
 
 @app.post("/api/retry/{video_id}")
-async def retry_video(video_id: str):
-    """重新处理视频"""
-    if not is_ready():
-        raise HTTPException(400, "请先完成初始配置")
+async def retry_video(
+    video_id: str,
+    from_stage: str = Query(
+        "auto",
+        description="auto=有转写则续跑笔记；notes_only=仅笔记；full=从头转写+笔记",
+    ),
+):
+    """重新处理；有已保存转写时可从笔记阶段继续。"""
+    if not is_fully_ready():
+        if not is_settings_ready():
+            raise HTTPException(400, "请先完成设置")
+        raise HTTPException(400, "请先下载所选 Whisper 模型")
 
     video = get_video(video_id)
     if video is None:
         raise HTTPException(404, "记录不存在")
 
-    # 检查上传文件是否还存在
-    found = find_video_path(video_id)
+    stage = (from_stage or "auto").strip().lower()
+    if stage not in ("auto", "full", "notes_only"):
+        raise HTTPException(400, "from_stage 须为 auto、full 或 notes_only")
+
+    can_resume = video_has_resumable_transcript(video)
+    if stage == "auto":
+        notes_only = can_resume
+    elif stage == "notes_only":
+        if not can_resume:
+            raise HTTPException(
+                400,
+                "无已保存的转写，无法从笔记阶段继续，请使用「从头重新处理」",
+            )
+        notes_only = True
+    else:
+        notes_only = False
+
+    found = resolve_video_path(video_id)
     if found is not None:
         video_path = str(found)
+    elif notes_only:
+        video_path = ""
     else:
-        raise HTTPException(400, "视频文件已丢失，无法重新处理")
+        if video and (video.get("source_path") or "").strip():
+            raise HTTPException(
+                400,
+                "原视频文件已移动或删除，无法重新处理",
+            )
+        raise HTTPException(400, "上传的视频副本已丢失，请重新上传")
 
-    update_status(video_id, "pending", 0)
-    asyncio.create_task(process_video(video_id, video_path, Path(video_path).suffix))
+    prepare_retry(video_id, notes_only=notes_only)
+    asyncio.create_task(
+        process_video(
+            video_id,
+            video_path,
+            Path(video_path).suffix if video_path else ".mp4",
+            notes_only=notes_only,
+        )
+    )
 
-    return {"message": "已重新开始处理", "task_id": video_id}
+    if notes_only:
+        msg = "已从笔记阶段继续（跳过转写）"
+        mode = "notes_only"
+    else:
+        msg = "已从头重新处理（转写 + 笔记）"
+        mode = "full"
+
+    return {"message": msg, "task_id": video_id, "resume_mode": mode}
 
 
 if __name__ == "__main__":

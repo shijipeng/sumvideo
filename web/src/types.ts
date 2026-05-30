@@ -26,8 +26,14 @@ export interface VideoStatus {
   chapters?: NoteSection[] | null
   /** 概述（方案 B）；旧数据可能为整篇 Markdown */
   summary?: string | null
+  /** 失败原因（与 transcript 分离，便于断点续跑） */
+  error_message?: string | null
+  /** 可从笔记阶段继续（转写已保存） */
+  resume_available?: boolean
   created_at: string
   updated_at?: string
+  /** 桌面端：用户原视频绝对路径 */
+  source_path?: string | null
 }
 
 export interface HistoryItem {
@@ -37,10 +43,12 @@ export interface HistoryItem {
   progress: number
   created_at: string
   updated_at?: string
+  source_path?: string | null
 }
 
 export interface UploadResponse {
   task_id?: string
+  source_path?: string
   duplicate: boolean
   existing?: {
     id: string
@@ -81,6 +89,8 @@ export interface ModelDownloadState {
   message: string
   model_id: string | null
   error: string | null
+  bytes_downloaded?: number
+  bytes_total?: number
   model_ready?: boolean
   ready?: boolean
 }

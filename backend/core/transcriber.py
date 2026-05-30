@@ -1,20 +1,33 @@
 """视频转写：Mac 用 MLX Whisper，Windows/Linux 用 faster-whisper"""
 
+import hashlib
 import os
 import subprocess
 from pathlib import Path
 
 from core.hf_cache import setup_hf_hub_cache
+from core.paths import audio_dir
 from core.whisper_models import get_model_spec
 
 setup_hf_hub_cache()
+
+
+def _ffmpeg_bin() -> str:
+    return (os.environ.get("SUMVIDEO_FFMPEG") or "ffmpeg").strip() or "ffmpeg"
+
+
+def _ffprobe_bin() -> str:
+    ff = _ffmpeg_bin()
+    if ff.endswith("ffmpeg"):
+        return ff[:-6] + "ffprobe"
+    return "ffprobe"
 
 
 def extract_audio(video_path: str, audio_path: str) -> str:
     """用 ffmpeg 从视频中提取音频"""
     result = subprocess.run(
         [
-            "ffmpeg", "-i", video_path,
+            _ffmpeg_bin(), "-i", video_path,
             "-vn",
             "-acodec", "pcm_s16le",
             "-ar", "16000",
@@ -35,7 +48,7 @@ def _audio_duration_seconds(audio_path: str) -> float:
     try:
         result = subprocess.run(
             [
-                "ffprobe",
+                _ffprobe_bin(),
                 "-v",
                 "error",
                 "-show_entries",
@@ -54,45 +67,49 @@ def _audio_duration_seconds(audio_path: str) -> float:
     return 1.0
 
 
-def _transcribe_mlx(audio_path: str, model_name: str, progress_callback=None) -> dict:
-    import os
-
-    from tqdm.auto import tqdm as BaseTqdm
-
-    from core.hf_cache import HF_OFFICIAL_ENDPOINT, setup_hf_hub_cache
-
-    setup_hf_hub_cache()
-    os.environ["HF_ENDPOINT"] = HF_OFFICIAL_ENDPOINT
-
-    # 必须先加载子模块：mlx_whisper.__init__ 会把 transcribe 导出为函数，
-    # 若先 import mlx_whisper，则 mlx_whisper.transcribe 指向函数而非子模块。
-    import importlib
-
-    mlx_whisper = importlib.import_module("mlx_whisper")
-    mlx_transcribe_mod = importlib.import_module("mlx_whisper.transcribe")
-
-    if not progress_callback:
+def _mlx_transcribe_once(
+    mlx_whisper,
+    audio_path: str,
+    model_name: str,
+    *,
+    progress_callback=None,
+    mlx_transcribe_mod=None,
+) -> dict:
+    """单次 MLX 转写；progress_callback 时通过静默 tqdm 更新 DB，不写终端。"""
+    if not progress_callback or mlx_transcribe_mod is None:
         return mlx_whisper.transcribe(
             audio_path,
             path_or_hf_repo=model_name,
             verbose=False,
         )
 
+    from tqdm.auto import tqdm as BaseTqdm
+
     class _MLXTranscribeProgress(BaseTqdm):
-        """把 mlx_whisper 内部 tqdm（按帧）同步到任务进度"""
+        """把 mlx_whisper 内部 tqdm（按帧）同步到任务进度，不向 stdout 画条。"""
 
         def __init__(self, *args, **kwargs):
-            kwargs.setdefault("disable", False)
+            # 不向终端画进度条，避免 uvicorn/管道环境下 Broken pipe
+            kwargs.setdefault("disable", True)
             self._cb = progress_callback
             super().__init__(*args, **kwargs)
 
         def update(self, n=1):
-            result = super().update(n)
+            try:
+                result = super().update(n)
+            except BrokenPipeError:
+                result = None
             if self._cb and self.total and self.total > 0:
                 frac = min(1.0, self.n / self.total)
                 pct = 10 + int(frac * 80)
                 self._cb(pct, f"转写中… {int(frac * 100)}%")
             return result
+
+        def close(self):
+            try:
+                super().close()
+            except BrokenPipeError:
+                pass
 
     old_tqdm = mlx_transcribe_mod.tqdm.tqdm
 
@@ -108,6 +125,35 @@ def _transcribe_mlx(audio_path: str, model_name: str, progress_callback=None) ->
         )
     finally:
         mlx_transcribe_mod.tqdm.tqdm = old_tqdm
+
+
+def _transcribe_mlx(audio_path: str, model_name: str, progress_callback=None) -> dict:
+    import os
+    import importlib
+
+    from core.hf_cache import HF_OFFICIAL_ENDPOINT, setup_hf_hub_cache
+
+    setup_hf_hub_cache()
+    os.environ["HF_ENDPOINT"] = HF_OFFICIAL_ENDPOINT
+
+    mlx_whisper = importlib.import_module("mlx_whisper")
+    mlx_transcribe_mod = importlib.import_module("mlx_whisper.transcribe")
+
+    try:
+        return _mlx_transcribe_once(
+            mlx_whisper,
+            audio_path,
+            model_name,
+            progress_callback=progress_callback,
+            mlx_transcribe_mod=mlx_transcribe_mod,
+        )
+    except BrokenPipeError:
+        # 管道后端或 tqdm 仍可能触发，降级为无进度条再试一次
+        return mlx_whisper.transcribe(
+            audio_path,
+            path_or_hf_repo=model_name,
+            verbose=False,
+        )
 
 
 def _transcribe_faster_whisper(
@@ -159,9 +205,10 @@ def transcribe(
         raise ValueError(f"未知的 Whisper 模型: {model_id}")
 
     engine = spec["engine"]
-    audio_dir = Path(video_path).parent / ".audio_temp"
-    audio_dir.mkdir(parents=True, exist_ok=True)
-    audio_path = str(audio_dir / f"{Path(video_path).stem}.wav")
+    ad = audio_dir()
+    ad.mkdir(parents=True, exist_ok=True)
+    path_key = hashlib.md5(video_path.encode(), usedforsecurity=False).hexdigest()[:10]
+    audio_path = str(ad / f"{Path(video_path).stem}_{path_key}.wav")
 
     try:
         extract_audio(video_path, audio_path)
@@ -184,7 +231,3 @@ def transcribe(
     finally:
         if os.path.exists(audio_path):
             os.remove(audio_path)
-        try:
-            audio_dir.rmdir()
-        except OSError:
-            pass

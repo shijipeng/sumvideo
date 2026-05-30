@@ -145,10 +145,12 @@ sumvideo/
 
 | 平台 | 引擎 | 示例模型 ID |
 |------|------|-------------|
-| macOS Apple Silicon | `mlx_whisper` | `mlx-community/whisper-large-v3-mlx` |
-| Windows / Linux / Intel Mac | `faster_whisper` | `large-v3`, `medium`, `small` |
+| macOS Apple Silicon | `mlx_whisper` | 默认 `mlx-community/whisper-medium-mlx`；可选 large / small |
+| Windows / Linux / Intel Mac | `faster_whisper` | 默认 `medium`；可选 large-v3 / small |
 
-模型缓存目录：`backend/models/`（`HUGGINGFACE_HUB_CACHE`），不写入用户全局 `~/.cache`。
+模型缓存目录：用户数据目录 `models/`（环境变量 `SUMVIDEO_DATA_DIR`；Web 开发默认 `backend/models/`），不写入用户全局 `~/.cache`。
+
+桌面端（Electron）见 [DESKTOP.md](./DESKTOP.md)：与 Web 统一走 `POST /api/upload` 写入 `uploads/`，播放走 `/api/video/{id}`。
 
 ### 5.6 前端其它选型说明
 

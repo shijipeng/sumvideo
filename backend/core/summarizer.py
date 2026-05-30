@@ -1,11 +1,16 @@
 """DeepSeek API：结构化视频笔记（概述 + 可定位分段）"""
 
 import json
+import logging
 import re
-from openai import OpenAI
+
+import httpx
+from openai import APIConnectionError, APIStatusError, APITimeoutError, OpenAI
 
 from config import DEEPSEEK_BASE_URL
 from core.settings_store import get_api_key, get_deepseek_model
+
+logger = logging.getLogger(__name__)
 
 
 def get_client() -> OpenAI:
@@ -19,7 +24,9 @@ def get_client() -> OpenAI:
             "DeepSeek API Key 无效（当前保存的不是 sk- 开头的密钥）。"
             "请打开「模型与 API 设置」重新填写。"
         )
-    return OpenAI(api_key=api_key, base_url=DEEPSEEK_BASE_URL)
+    # 连接超时避免「一直 88%」假死；总超时覆盖长转写笔记
+    timeout = httpx.Timeout(300.0, connect=30.0)
+    return OpenAI(api_key=api_key, base_url=DEEPSEEK_BASE_URL, timeout=timeout)
 
 
 def _friendly_api_error(exc: Exception) -> str:
@@ -29,6 +36,14 @@ def _friendly_api_error(exc: Exception) -> str:
         return (
             "DeepSeek API Key 无效或已过期，请在「模型与 API 设置」中重新填写正确的 sk- 密钥。"
         )
+    if "503" in msg or "service is too busy" in lower or "service_unavailable" in lower:
+        return (
+            "DeepSeek 服务繁忙（503），请稍后重试或暂时在设置中改用 deepseek-chat。"
+        )
+    if isinstance(exc, APITimeoutError) or "timed out" in lower:
+        return "DeepSeek 请求超时，请检查网络或稍后重试。"
+    if isinstance(exc, APIConnectionError):
+        return "无法连接 DeepSeek API，请检查网络能否访问 api.deepseek.com。"
     return msg
 
 
@@ -105,25 +120,51 @@ def _normalize_sections(sections: list) -> list[dict]:
     return out
 
 
+def _build_messages(transcript_text: str) -> list[dict]:
+    """user 内容须含 json 字样，否则 response_format=json_object 会 400。"""
+    text = transcript_text[:60000]
+    return [
+        {"role": "system", "content": NOTES_PROMPT},
+        {
+            "role": "user",
+            "content": (
+                "请根据以下视频转写文本，按 system 要求输出 json 对象（仅 JSON，无其它文字）：\n\n"
+                f"{text}"
+            ),
+        },
+    ]
+
+
 def generate_notes(transcript_text: str) -> dict:
     """生成 { overview, sections }，sections 同时用作章节导航与笔记分段。"""
     client = get_client()
-    text = transcript_text[:60000]
+    model = get_deepseek_model()
+    messages = _build_messages(transcript_text)
+
+    # 使用 V4 默认思考模式（不显式关闭 thinking）；长视频可能较慢
+    create_kwargs = {
+        "model": model,
+        "messages": messages,
+        "response_format": {"type": "json_object"},
+    }
+
+    logger.info("DeepSeek 请求: model=%s, 转写约 %s 字", model, len(transcript_text))
 
     try:
-        resp = client.chat.completions.create(
-            model=get_deepseek_model(),
-            messages=[
-                {"role": "system", "content": NOTES_PROMPT},
-                {"role": "user", "content": text},
-            ],
-            temperature=0.3,
-            response_format={"type": "json_object"},
-        )
+        resp = client.chat.completions.create(**create_kwargs)
+    except APIStatusError as e:
+        raise ValueError(_friendly_api_error(e)) from e
+    except (APITimeoutError, APIConnectionError) as e:
+        raise ValueError(_friendly_api_error(e)) from e
     except Exception as e:
         raise ValueError(_friendly_api_error(e)) from e
 
-    content = resp.choices[0].message.content or "{}"
+    logger.info("DeepSeek 响应成功")
+
+    if not resp.choices:
+        raise ValueError("DeepSeek 返回为空（无 choices）")
+    message = resp.choices[0].message
+    content = (message.content or "").strip() or "{}"
     try:
         result = _parse_json_content(content)
     except (json.JSONDecodeError, IndexError):

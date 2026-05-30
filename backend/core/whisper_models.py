@@ -19,8 +19,8 @@ WHISPER_MODEL_OPTIONS: list[dict] = [
         "platforms": ["darwin"],
         "label": "Large v3（最准确）",
         "group": "Mac · Apple Silicon (MLX)",
-        "platform_hint": "M1/M2/M3/M4 推荐",
-        "recommended_on": ["darwin"],
+        "platform_hint": "追求最高准确度",
+        "recommended_on": [],
     },
     {
         "id": "mlx-community/whisper-medium-mlx",
@@ -28,8 +28,8 @@ WHISPER_MODEL_OPTIONS: list[dict] = [
         "platforms": ["darwin"],
         "label": "Medium（均衡）",
         "group": "Mac · Apple Silicon (MLX)",
-        "platform_hint": "速度与质量平衡",
-        "recommended_on": [],
+        "platform_hint": "M 系列推荐，速度与质量平衡",
+        "recommended_on": ["darwin"],
     },
     {
         "id": "mlx-community/whisper-small-mlx",
@@ -47,8 +47,8 @@ WHISPER_MODEL_OPTIONS: list[dict] = [
         "platforms": ["win32", "linux", "darwin_intel"],
         "label": "Large v3（最准确）",
         "group": "Windows / Linux / Intel Mac (faster-whisper)",
-        "platform_hint": "Win 推荐",
-        "recommended_on": ["win32", "linux", "darwin_intel"],
+        "platform_hint": "追求最高准确度",
+        "recommended_on": [],
     },
     {
         "id": "medium",
@@ -56,8 +56,8 @@ WHISPER_MODEL_OPTIONS: list[dict] = [
         "platforms": ["win32", "linux", "darwin_intel"],
         "label": "Medium（均衡）",
         "group": "Windows / Linux / Intel Mac (faster-whisper)",
-        "platform_hint": "速度与质量平衡",
-        "recommended_on": [],
+        "platform_hint": "Win / Intel Mac 推荐",
+        "recommended_on": ["win32", "linux", "darwin_intel"],
     },
     {
         "id": "small",

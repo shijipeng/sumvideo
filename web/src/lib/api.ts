@@ -7,6 +7,8 @@ import type {
   VideoStatus,
 } from '../types'
 import { parseApiError } from './errors'
+import { connectionHint } from './env'
+import { apiUrl } from './runtime'
 
 const DEFAULT_TIMEOUT_MS = 12_000
 
@@ -23,14 +25,14 @@ async function fetchWithTimeout(
     if (e instanceof DOMException && e.name === 'AbortError') {
       throw new Error('请求超时：后端可能正在处理视频，请稍后再试或重启后端')
     }
-    throw new Error('无法连接后端，请先启动 ./scripts/start-backend.sh')
+    throw new Error(`无法连接后端。${connectionHint()}`)
   } finally {
     window.clearTimeout(timer)
   }
 }
 
 export async function getSettings(): Promise<AppSettings> {
-  const res = await fetchWithTimeout('/api/settings')
+  const res = await fetchWithTimeout(apiUrl('/api/settings'))
   if (!res.ok) throw new Error('无法读取设置')
   return res.json()
 }
@@ -40,7 +42,7 @@ export async function saveSettings(payload: {
   whisper_model: string
   deepseek_model: string
 }): Promise<{ ready: boolean; message: string }> {
-  const res = await fetch('/api/settings', {
+  const res = await fetch(apiUrl('/api/settings'), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
@@ -53,7 +55,7 @@ export async function saveSettings(payload: {
 }
 
 export async function clearSettings(): Promise<void> {
-  const res = await fetch('/api/settings', { method: 'DELETE' })
+  const res = await fetch(apiUrl('/api/settings'), { method: 'DELETE' })
   if (!res.ok) throw new Error('清除失败')
 }
 
@@ -63,7 +65,7 @@ export async function getModelStatus(): Promise<{
   hint: ModelDownloadHint
   download: ModelDownloadState
 }> {
-  const res = await fetch('/api/models/status')
+  const res = await fetch(apiUrl('/api/models/status'))
   if (!res.ok) {
     const err = await res.json().catch(() => ({}))
     throw new Error(parseApiError(err, '无法获取模型状态'))
@@ -77,7 +79,7 @@ export async function startModelDownload(): Promise<{
   message: string
   download: ModelDownloadState
 }> {
-  const res = await fetch('/api/models/download', { method: 'POST' })
+  const res = await fetch(apiUrl('/api/models/download'), { method: 'POST' })
   if (!res.ok) {
     const err = await res.json().catch(() => ({}))
     throw new Error(parseApiError(err, '无法开始下载'))
@@ -86,7 +88,7 @@ export async function startModelDownload(): Promise<{
 }
 
 export async function getModelDownloadStatus(): Promise<ModelDownloadState> {
-  const res = await fetch('/api/models/download/status')
+  const res = await fetch(apiUrl('/api/models/download/status'))
   if (!res.ok) throw new Error('无法获取下载进度')
   return res.json()
 }
@@ -94,7 +96,7 @@ export async function getModelDownloadStatus(): Promise<ModelDownloadState> {
 export async function uploadVideo(file: File, force = false): Promise<UploadResponse> {
   const form = new FormData()
   form.append('file', file)
-  const url = force ? '/api/upload?force=true' : '/api/upload'
+  const url = force ? apiUrl('/api/upload?force=true') : apiUrl('/api/upload')
   const res = await fetch(url, { method: 'POST', body: form })
   if (!res.ok) {
     const err = await res.json().catch(() => ({}))
@@ -104,7 +106,8 @@ export async function uploadVideo(file: File, force = false): Promise<UploadResp
 }
 
 export async function getStatus(taskId: string): Promise<VideoStatus> {
-  const res = await fetchWithTimeout(`/api/status/${taskId}`)
+  // 处理中长视频时后端忙于转写/DeepSeek，轮询放宽超时
+  const res = await fetchWithTimeout(apiUrl(`/api/status/${taskId}`), undefined, 60_000)
   if (!res.ok) {
     if (res.status === 404) throw new Error('任务不存在（可能已删除或后端已重置）')
     throw new Error(`获取状态失败 (HTTP ${res.status})`)
@@ -112,8 +115,14 @@ export async function getStatus(taskId: string): Promise<VideoStatus> {
   return res.json()
 }
 
-export async function retryVideo(taskId: string): Promise<{ message: string; task_id: string }> {
-  const res = await fetch(`/api/retry/${taskId}`, { method: 'POST' })
+export type RetryFromStage = 'auto' | 'full' | 'notes_only'
+
+export async function retryVideo(
+  taskId: string,
+  fromStage: RetryFromStage = 'auto',
+): Promise<{ message: string; task_id: string; resume_mode?: string }> {
+  const q = fromStage === 'auto' ? '' : `?from_stage=${encodeURIComponent(fromStage)}`
+  const res = await fetch(apiUrl(`/api/retry/${taskId}${q}`), { method: 'POST' })
   if (!res.ok) {
     const err = await res.json().catch(() => ({}))
     throw new Error(parseApiError(err, `重新处理失败 (HTTP ${res.status})`))
@@ -122,18 +131,18 @@ export async function retryVideo(taskId: string): Promise<{ message: string; tas
 }
 
 export async function getHistory(): Promise<HistoryItem[]> {
-  const res = await fetchWithTimeout('/api/history')
+  const res = await fetchWithTimeout(apiUrl('/api/history'))
   if (!res.ok) throw new Error('获取历史失败')
   return res.json()
 }
 
 export async function deleteHistory(id: string): Promise<void> {
-  const res = await fetch(`/api/history/${id}`, { method: 'DELETE' })
+  const res = await fetch(apiUrl(`/api/history/${id}`), { method: 'DELETE' })
   if (!res.ok) throw new Error('删除失败')
 }
 
 export function videoStreamUrl(taskId: string) {
-  return `/api/video/${taskId}`
+  return apiUrl(`/api/video/${taskId}`)
 }
 
 export function exportMindmapMd(filename: string, markdown: string) {

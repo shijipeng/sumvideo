@@ -1,0 +1,36 @@
+{
+  "dev": {
+    "label": "本地 Web / Electron 开发",
+    "backend": {
+      "host": "127.0.0.1",
+      "port": 8000,
+      "url": "http://127.0.0.1:8000"
+    },
+    "frontend": {
+      "host": "127.0.0.1",
+      "port": 5173,
+      "url": "http://127.0.0.1:5173"
+    },
+    "electron": {
+      "reuseBackend": true,
+      "loadFrontendDevServer": true
+    }
+  },
+  "desktop": {
+    "label": "已安装的桌面应用（生产）",
+    "backend": {
+      "host": "127.0.0.1",
+      "port": 8001,
+      "url": "http://127.0.0.1:8001"
+    },
+    "frontend": {
+      "host": null,
+      "port": null,
+      "url": null
+    },
+    "electron": {
+      "reuseBackend": false,
+      "loadFrontendDevServer": false
+    }
+  }
+}

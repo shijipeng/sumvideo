@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import threading
+import time
 from pathlib import Path
 
 from tqdm.auto import tqdm as BaseTqdm
@@ -16,6 +17,7 @@ from core.hf_cache import (
     resolve_hf_endpoint,
     setup_hf_hub_cache,
 )
+from core.paths import get_data_dir
 from core.whisper_models import get_model_spec
 
 setup_hf_hub_cache()
@@ -45,6 +47,9 @@ FASTER_WHISPER_HF_REPO = {
     "small": "Systran/faster-whisper-small",
 }
 
+STALL_SECONDS = 90
+DOWNLOAD_PROGRESS_CAP = 95
+
 _lock = threading.Lock()
 _state = {
     "status": "idle",  # idle | downloading | done | error
@@ -52,15 +57,19 @@ _state = {
     "message": "",
     "model_id": None,
     "error": None,
+    "bytes_updated_at": None,
+    "started_at": None,
 }
-_STATE_FILE = Path(__file__).resolve().parent.parent / ".local" / "download_state.json"
+def _state_file() -> Path:
+    return get_data_dir() / "download_state.json"
 
 
 def _load_persisted_state() -> None:
-    if not _STATE_FILE.exists():
+    sf = _state_file()
+    if not sf.exists():
         return
     try:
-        data = json.loads(_STATE_FILE.read_text(encoding="utf-8"))
+        data = json.loads(sf.read_text(encoding="utf-8"))
         with _lock:
             _state.update({k: data[k] for k in _state if k in data})
     except (OSError, json.JSONDecodeError, TypeError):
@@ -68,6 +77,35 @@ def _load_persisted_state() -> None:
 
 
 _load_persisted_state()
+
+
+def _recover_stale_download_state() -> None:
+    """进程重启后无下载线程，勿长期停在 downloading。"""
+    with _lock:
+        if _state.get("status") != "downloading":
+            return
+        model_id = _state.get("model_id")
+    if not model_id:
+        _set_state(status="idle", progress=0, message="", error=None)
+        return
+    with _lock:
+        _state["status"] = "idle"
+    if is_model_cached(model_id):
+        _set_state(
+            status="done",
+            progress=100,
+            message="模型已就绪",
+            model_id=model_id,
+            error=None,
+        )
+        return
+    _set_state(
+        status="error",
+        progress=0,
+        message="上次下载未完成",
+        error="下载已中断，请重新点击「开始下载」",
+        model_id=model_id,
+    )
 
 
 def _hf_repo_id(model_id: str, engine: str) -> str:
@@ -91,11 +129,39 @@ def _expected_bytes(model_id: str) -> int:
     return int(size_gb * (1024**3))
 
 
+def _progress_from_bytes(size: int, expected: int, *, cap: int = DOWNLOAD_PROGRESS_CAP) -> int:
+    """按已下载字节线性计算进度（0–cap），避免早期虚高。"""
+    if expected <= 0:
+        return min(cap, 50)
+    if size <= 0:
+        return 0
+    return min(cap, max(1, int(size * 100 / expected)))
+
+
+def _is_download_stalled() -> bool:
+    with _lock:
+        if _state.get("status") != "downloading":
+            return False
+        updated_at = _state.get("bytes_updated_at") or 0
+        started_at = _state.get("started_at") or 0
+    ref = updated_at or started_at
+    if ref <= 0:
+        return False
+    return time.time() - ref >= STALL_SECONDS
+
+
+def _configure_hf_download_timeouts() -> None:
+    os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "120")
+    os.environ.setdefault("HF_HUB_ETAG_TIMEOUT", "30")
+
+
 class _HubDownloadProgress(BaseTqdm):
     """把 huggingface_hub 的 tqdm 进度同步到下载状态，供前端轮询展示"""
 
     def __init__(self, *args, **kwargs):
-        kwargs.setdefault("disable", False)
+        # disable=True 时 tqdm 不会设置 desc 属性，需自行保存
+        self._progress_label = (kwargs.get("desc") or "下载模型文件").strip()
+        kwargs.setdefault("disable", True)
         super().__init__(*args, **kwargs)
         self._sync()
 
@@ -104,12 +170,19 @@ class _HubDownloadProgress(BaseTqdm):
         self._sync()
         return result
 
+    def refresh(self, *args, **kwargs):
+        result = super().refresh(*args, **kwargs) if hasattr(super(), "refresh") else None
+        self._sync()
+        return result
+
     def _sync(self):
-        if not self.total:
+        total = getattr(self, "total", None)
+        if not total or total <= 0:
             return
-        pct = int((self.n / self.total) * 90) + 5
-        label = (self.desc or "下载模型文件中").strip()
-        _set_state(progress=min(pct, 95), message=f"{label}… {min(pct, 95)}%")
+        label = getattr(self, "desc", None) or self._progress_label or "下载模型文件"
+        if isinstance(label, str):
+            label = label.strip() or "下载模型文件"
+        _set_state(message=f"正在下载 {label}…")
 
 
 def _monitor_cache_size(model_id: str, repo_id: str, stop_event: threading.Event):
@@ -119,18 +192,39 @@ def _monitor_cache_size(model_id: str, repo_id: str, stop_event: threading.Event
 
         folder = Path(get_cache_dir()) / repo_folder_name(repo_id=repo_id, repo_type="model")
         expected = _expected_bytes(model_id)
-        while not stop_event.wait(2):
+        last_size = -1
+        last_change = time.monotonic()
+        while not stop_event.wait(1):
             if not folder.exists():
                 continue
-            size = sum(f.stat().st_size for f in folder.rglob("*") if f.is_file())
+            size = _repo_bytes_on_disk(repo_id, include_incomplete=True)
             if size <= 0:
                 continue
-            pct = min(95, int(size / expected * 90) + 5) if expected else 50
+            now = time.monotonic()
+            if size > last_size:
+                last_size = size
+                last_change = now
+            elif now - last_change >= STALL_SECONDS:
+                mb = size / (1024**2)
+                _set_state(
+                    status="error",
+                    progress=_progress_from_bytes(size, expected),
+                    message=f"下载停滞于 {mb:.1f} MB",
+                    error=(
+                        f"超过 {STALL_SECONDS} 秒无新数据。"
+                        "若使用代理（如 Clash 7897），请确认 huggingface.co 可访问，"
+                        "或暂时关闭系统代理后点击「开始下载」重试。"
+                    ),
+                    bytes_updated_at=time.time(),
+                )
+                return
+            pct = _progress_from_bytes(size, expected)
             mb = size / (1024**2)
             total_mb = expected / (1024**2)
             _set_state(
                 progress=pct,
-                message=f"已下载 {mb:.0f} MB / 约 {total_mb:.0f} MB（{pct}%）",
+                message=f"已写入磁盘 {mb:.1f} MB / 约 {total_mb:.0f} MB",
+                bytes_updated_at=time.time(),
             )
     except Exception:
         pass
@@ -152,14 +246,21 @@ def _has_incomplete_blobs(repo_id: str) -> bool:
     return False
 
 
-def _repo_bytes_on_disk(repo_id: str) -> int:
+def _repo_bytes_on_disk(repo_id: str, *, include_incomplete: bool = False) -> int:
+    """include_incomplete=True 时计入 .incomplete 临时文件（下载进度用）。"""
     folder = _repo_cache_folder(repo_id)
     if not folder.exists():
         return 0
     total = 0
     for path in folder.rglob("*"):
-        if path.is_file() and ".incomplete" not in path.name:
+        if not path.is_file():
+            continue
+        if not include_incomplete and ".incomplete" in path.name:
+            continue
+        try:
             total += path.stat().st_size
+        except OSError:
+            continue
     return total
 
 
@@ -261,18 +362,21 @@ def _snapshot_download_repo(repo_id: str, engine: str) -> str:
     cache_dir = get_cache_dir()
     endpoints = _download_endpoints(engine)
     last_error: Exception | None = None
+    _configure_hf_download_timeouts()
 
     for i, (endpoint, label) in enumerate(endpoints):
         os.environ["HF_ENDPOINT"] = endpoint
         try:
             _set_state(
-                progress=5,
+                progress=0,
                 message=f"正在从 {label} 下载 {repo_id}…",
             )
             return snapshot_download(
                 repo_id=repo_id,
                 cache_dir=cache_dir,
                 endpoint=endpoint,
+                etag_timeout=30,
+                max_workers=4,
                 tqdm_class=_HubDownloadProgress,
             )
         except Exception as e:
@@ -288,30 +392,73 @@ def _snapshot_download_repo(repo_id: str, engine: str) -> str:
     raise last_error or RuntimeError("下载失败")
 
 
-def _live_progress_from_disk(model_id: str) -> tuple[int, str] | None:
+def _disk_progress(model_id: str) -> dict | None:
+    """按缓存目录体积计算进度（含 .incomplete）。"""
     spec = get_model_spec(model_id)
     if not spec:
         return None
     repo_id = _hf_repo_id(model_id, spec["engine"])
-    size = _repo_bytes_on_disk(repo_id)
+    size = _repo_bytes_on_disk(repo_id, include_incomplete=True)
     if size <= 0:
         return None
     expected = _expected_bytes(model_id)
-    pct = min(95, int(size / expected * 90) + 5) if expected else 50
-    mb = size / (1024**2)
-    total_mb = expected / (1024**2)
-    return pct, f"已下载 {mb:.0f} MB / 约 {total_mb:.0f} MB（{pct}%）"
+    pct = _progress_from_bytes(size, expected)
+    mb = round(size / (1024**2), 1)
+    total_mb = round(expected / (1024**2), 0)
+    return {
+        "progress": pct,
+        "message": f"已写入磁盘 {mb} MB / 约 {int(total_mb)} MB",
+        "bytes_downloaded": size,
+        "bytes_total": expected,
+    }
+
+
+def reconcile_download_state() -> None:
+    """切换 Whisper 模型后，清除与当前选择不一致或过期的 download_state。"""
+    try:
+        from core.settings_store import get_whisper_model, is_settings_ready
+
+        if not is_settings_ready():
+            return
+        current = get_whisper_model()
+    except Exception:
+        return
+
+    with _lock:
+        stored_id = _state.get("model_id")
+        stored_status = _state.get("status")
+
+    if stored_id and stored_id != current:
+        _set_state(
+            status="idle",
+            progress=0,
+            message="",
+            model_id=None,
+            error=None,
+        )
+        return
+
+    if stored_status == "done" and not is_model_cached(current):
+        _set_state(
+            status="idle",
+            progress=0,
+            message="",
+            error=None,
+        )
 
 
 def get_download_status() -> dict:
+    reconcile_download_state()
     with _lock:
         state = dict(_state)
-    if state.get("status") == "downloading" and state.get("model_id"):
-        live = _live_progress_from_disk(state["model_id"])
-        if live:
-            pct, msg = live
-            state["progress"] = max(state.get("progress", 0), pct)
-            state["message"] = msg
+    model_id = state.get("model_id")
+    if state.get("status") == "downloading" and model_id:
+        disk = _disk_progress(model_id)
+        if disk:
+            state["progress"] = disk["progress"]
+            state["message"] = disk["message"]
+            state["bytes_downloaded"] = disk["bytes_downloaded"]
+            state["bytes_total"] = disk["bytes_total"]
     return state
 
 
@@ -320,8 +467,9 @@ def _set_state(**kwargs):
         _state.update(kwargs)
         snapshot = dict(_state)
     try:
-        _STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        _STATE_FILE.write_text(
+        sf = _state_file()
+        sf.parent.mkdir(parents=True, exist_ok=True)
+        sf.write_text(
             json.dumps(snapshot, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
@@ -355,13 +503,19 @@ def _run_download(model_id: str):
     try:
         _set_state(
             status="downloading",
-            progress=5,
+            progress=0,
             message=f"正在从 Hugging Face 下载 {repo_id}…",
             model_id=model_id,
             error=None,
+            started_at=time.time(),
+            bytes_updated_at=time.time(),
         )
         monitor.start()
         _snapshot_download_repo(repo_id, spec["engine"])
+        with _lock:
+            stalled = _state.get("status") == "error"
+        if stalled:
+            return
         _set_state(
             status="done",
             progress=100,
@@ -386,7 +540,9 @@ def start_download(model_id: str) -> bool:
     """在后台线程启动下载，若已在下载同一模型则返回 False"""
     with _lock:
         if _state["status"] == "downloading" and _state.get("model_id") == model_id:
-            return False
+            if not _is_download_stalled():
+                return False
+            _state["status"] = "idle"
 
     if is_model_cached(model_id):
         _set_state(
@@ -408,3 +564,6 @@ def start_download(model_id: str) -> bool:
     thread = threading.Thread(target=_run_download, args=(model_id,), daemon=True)
     thread.start()
     return True
+
+
+_recover_stale_download_state()

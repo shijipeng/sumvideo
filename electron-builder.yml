@@ -1,0 +1,42 @@
+appId: com.sumvideo.app
+productName: SumVideo
+directories:
+  output: dist/desktop
+  buildResources: electron/build
+files:
+  - electron/**/*
+  - web/dist/**/*
+extraResources:
+  - from: backend
+    to: backend
+    filter:
+      - "**/*"
+      - "!**/.venv/**"
+      - "!**/uploads/**"
+      - "!**/audio/**"
+      - "!**/models/**"
+      - "!**/.local/**"
+      - "!**/settings.json"
+      - "!**/download_state.json"
+      - "!**/__pycache__/**"
+      - "!**/*.db"
+  - from: dist/venv-darwin-arm64
+    to: venv
+    filter:
+      - "**/*"
+  - from: electron/resources/bin/darwin-arm64
+    to: bin
+    filter:
+      - "**/*"
+mac:
+  target:
+    - dmg
+    - zip
+  defaultArch: arm64
+  category: public.app-category.productivity
+win:
+  target:
+    - nsis
+  defaultArch: x64
+extraMetadata:
+  main: electron/main.mjs

@@ -2,11 +2,11 @@
 # 在项目内启动后端（使用 backend/.venv，不依赖全局 Python 包）
 set -e
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck source=scripts/load-env.sh
+source "$ROOT/scripts/load-env.sh"
 cd "$ROOT/backend"
 
-# Whisper 模型目录（项目内专用，非 .cache）
-export HUGGINGFACE_HUB_CACHE="$ROOT/backend/models"
-mkdir -p "$HUGGINGFACE_HUB_CACHE"
+mkdir -p "$ROOT/backend/models" "$ROOT/backend/uploads" "$ROOT/backend/audio"
 
 if [ ! -d ".venv" ]; then
   echo "未找到 .venv，请先执行："
@@ -14,11 +14,16 @@ if [ ! -d ".venv" ]; then
   exit 1
 fi
 
-# Mac Apple Silicon（MLX）走官网；Windows/Linux 默认 hf-mirror 镜像
 if [ "$(uname -s)" = "Darwin" ] && [ "$(uname -m)" = "arm64" ]; then
   export HF_ENDPOINT="${HF_ENDPOINT:-https://huggingface.co}"
 else
   export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
 fi
 
-exec .venv/bin/uvicorn app:app --reload --host 127.0.0.1 --port 8000
+echo "SumVideo 后端 [${SUMVIDEO_ENV}] → ${SUMVIDEO_BACKEND_URL}"
+
+if [ -n "${SUMVIDEO_RELOAD:-}" ]; then
+  echo "热重载已开启（处理视频时改代码会中断任务）"
+  exec .venv/bin/uvicorn app:app --reload --host "$SUMVIDEO_BACKEND_HOST" --port "$SUMVIDEO_BACKEND_PORT"
+fi
+exec .venv/bin/uvicorn app:app --host "$SUMVIDEO_BACKEND_HOST" --port "$SUMVIDEO_BACKEND_PORT"

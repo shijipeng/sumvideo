@@ -19,7 +19,10 @@ import {
   uploadVideo,
   videoStreamUrl,
 } from './lib/api'
+import { pickVideoFile, readVideoAsFile } from './lib/runtime'
 import { formatUnknownError } from './lib/errors'
+import { canResumeFromNotes, formatTaskError } from './lib/taskResume'
+import type { RetryFromStage } from './lib/api'
 import { buildMindmapMarkdown, canBuildMindmap } from './lib/mindmapMarkdown'
 import { useTheme } from './theme/ThemeContext'
 import type { HistoryItem, NoteSection, VideoStatus } from './types'
@@ -45,7 +48,7 @@ function resolvePhase(s: {
   const settingsReady =
     s.settings_ready ?? Boolean(s.api_configured && s.whisper_model)
   if (!settingsReady) return 'setup'
-  if (!s.model_ready && !s.ready) return 'download'
+  if (!s.model_ready) return 'download'
   return 'main'
 }
 
@@ -100,9 +103,7 @@ export default function App() {
         <SetupGate
           isUpdate={setupIsUpdate}
           onSaved={async () => {
-            const s = await refreshPhase()
-            if (s?.model_ready) setPhase('main')
-            else setPhase('download')
+            await refreshPhase()
           }}
         />
       </div>
@@ -158,7 +159,7 @@ function MainWorkspace({
   const [sidebarCollapsed, setSidebarCollapsed] = useState(readSidebarCollapsed)
   const [rightTab, setRightTab] = useState<'notes' | 'mindmap'>('notes')
   const [duplicateModal, setDuplicateModal] = useState<{
-    file: File
+    file?: File
     existingId: string
     filename: string
   } | null>(null)
@@ -213,45 +214,49 @@ function MainWorkspace({
       refreshHistory()
       if (pollStatus.status === 'done') {
         setLoadedResult(pollStatus)
-        if (localVideoUrl && taskId) {
+        if (localVideoUrl?.startsWith('blob:')) {
           URL.revokeObjectURL(localVideoUrl)
           setLocalVideoUrl(null)
         }
       } else if (pollStatus.status === 'error') {
-        const msg = pollStatus.transcript?.trim() || '视频处理失败'
-        setError(`处理失败：${msg.length > 300 ? `${msg.slice(0, 300)}…` : msg}`)
+        setError(`处理失败：${formatTaskError(pollStatus)}`)
         console.error('[SumVideo] 处理失败', pollStatus)
         setLoadedResult(pollStatus)
       }
     }
   }, [pollStatus, refreshHistory, localVideoUrl, taskId])
 
+  const startProcessing = async (
+    res: Awaited<ReturnType<typeof uploadVideo>>,
+    file?: File,
+  ) => {
+    if (res.duplicate && res.existing) {
+      setDuplicateModal({
+        file,
+        existingId: res.existing.id,
+        filename: res.existing.filename,
+      })
+      return
+    }
+    if (res.task_id) {
+      setTaskId(res.task_id)
+      setPolling(true)
+    } else {
+      setError('未返回任务 ID，请查看后端日志')
+    }
+  }
+
   const handleFileSelect = async (file: File, force = false) => {
     setError(null)
-    if (localVideoUrl) URL.revokeObjectURL(localVideoUrl)
-    const url = URL.createObjectURL(file)
-    setLocalVideoUrl(url)
+    if (localVideoUrl?.startsWith('blob:')) URL.revokeObjectURL(localVideoUrl)
+    setLocalVideoUrl(URL.createObjectURL(file))
     setLocalFile(file)
     setLoadedResult(null)
     setUploading(true)
 
     try {
       const res = await uploadVideo(file, force)
-      if (res.duplicate && res.existing) {
-        setDuplicateModal({
-          file,
-          existingId: res.existing.id,
-          filename: res.existing.filename,
-        })
-        setUploading(false)
-        return
-      }
-      if (res.task_id) {
-        setTaskId(res.task_id)
-        setPolling(true)
-      } else {
-        setError('上传未返回任务 ID，请查看后端日志')
-      }
+      await startProcessing(res, file)
     } catch (e) {
       const msg = formatUnknownError(e, '上传失败')
       setError(msg)
@@ -261,12 +266,26 @@ function MainWorkspace({
     }
   }
 
+  const handleVideoSelect = async (file?: File, force = false) => {
+    if (file) {
+      await handleFileSelect(file, force)
+      return
+    }
+    const picked = await pickVideoFile()
+    if (!picked) return
+    try {
+      const videoFile = await readVideoAsFile(picked.path, picked.name)
+      await handleFileSelect(videoFile, force)
+    } catch (e) {
+      setError(formatUnknownError(e, '读取视频失败'))
+      console.error('[SumVideo] 读取视频失败', e)
+    }
+  }
+
   const loadHistoryItem = async (id: string) => {
     setError(null)
-    if (localVideoUrl) {
-      URL.revokeObjectURL(localVideoUrl)
-      setLocalVideoUrl(null)
-    }
+    if (localVideoUrl?.startsWith('blob:')) URL.revokeObjectURL(localVideoUrl)
+    setLocalVideoUrl(null)
     setLocalFile(null)
     setTaskId(id)
     try {
@@ -283,17 +302,25 @@ function MainWorkspace({
     }
   }
 
-  const handleRetry = async () => {
+  const handleRetry = async (fromStage: RetryFromStage = 'auto') => {
     if (!taskId) return
     setError(null)
     try {
-      await retryVideo(taskId)
+      const res = await retryVideo(taskId, fromStage)
       setPolling(true)
       setLoadedResult(null)
+      if (res.resume_mode === 'notes_only') {
+        setError(null)
+      }
     } catch (e) {
       setError(e instanceof Error ? e.message : '重新处理失败')
     }
   }
+
+  const showResumeNotes =
+    displayStatus?.status === 'error' &&
+    taskId &&
+    canResumeFromNotes(displayStatus)
 
   const handleTimeUpdate = useCallback(
     (time: number) => {
@@ -346,7 +373,7 @@ function MainWorkspace({
         </div>
         <div className="flex flex-wrap items-center gap-2">
           <UploadButton
-            onFileSelect={(f) => handleFileSelect(f)}
+            onSelect={(f) => handleVideoSelect(f)}
             disabled={uploading || isProcessing}
             uploading={uploading}
           />
@@ -408,13 +435,24 @@ function MainWorkspace({
             <div className="mx-4 mt-3 flex shrink-0 flex-wrap items-center gap-3 rounded-lg bg-[var(--sv-danger-bg)] px-4 py-2 text-sm text-[var(--sv-danger-fg)]">
               <span className="flex-1">{error}</span>
               {displayStatus?.status === 'error' && taskId && (
-                <button
-                  type="button"
-                  className="rounded-lg border border-[var(--sv-danger-fg)]/30 px-3 py-1 text-xs hover:opacity-80"
-                  onClick={handleRetry}
-                >
-                  重新处理
-                </button>
+                <>
+                  {showResumeNotes && (
+                    <button
+                      type="button"
+                      className="rounded-lg bg-[var(--sv-accent)] px-3 py-1 text-xs text-[var(--sv-accent-fg)] hover:opacity-90"
+                      onClick={() => handleRetry('notes_only')}
+                    >
+                      从笔记阶段继续
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    className="rounded-lg border border-[var(--sv-danger-fg)]/30 px-3 py-1 text-xs hover:opacity-80"
+                    onClick={() => handleRetry(showResumeNotes ? 'full' : 'auto')}
+                  >
+                    {showResumeNotes ? '从头重新处理' : '重新处理'}
+                  </button>
+                </>
               )}
             </div>
           )}
@@ -467,18 +505,16 @@ function MainWorkspace({
                       导出思维导图
                     </button>
                   )}
-                  {localFile && (
-                    <button
-                      type="button"
-                      className="rounded-lg border border-[var(--sv-border)] px-3 py-1.5 text-sm text-[var(--sv-fg)] hover:bg-[var(--sv-canvas-subtle)]"
-                      onClick={() => {
-                        if (taskId) handleRetry()
-                        else handleFileSelect(localFile, true)
-                      }}
-                    >
-                      强制重新处理
-                    </button>
-                  )}
+                  <button
+                    type="button"
+                    className="rounded-lg border border-[var(--sv-border)] px-3 py-1.5 text-sm text-[var(--sv-fg)] hover:bg-[var(--sv-canvas-subtle)]"
+                    onClick={() => {
+                      if (localFile) handleVideoSelect(localFile, true)
+                      else if (taskId) handleRetry('full')
+                    }}
+                  >
+                    强制从头处理
+                  </button>
                 </div>
               )}
             </div>
@@ -561,11 +597,14 @@ function MainWorkspace({
                 onClick={async () => {
                   const { existingId, file } = duplicateModal
                   setDuplicateModal(null)
-                  if (localVideoUrl) {
+                  if (localVideoUrl?.startsWith('blob:')) {
                     URL.revokeObjectURL(localVideoUrl)
                     setLocalVideoUrl(null)
                   }
-                  setLocalFile(file)
+                  if (file) {
+                    setLocalFile(file)
+                    setLocalVideoUrl(URL.createObjectURL(file))
+                  }
                   setTaskId(existingId)
                   setLoadedResult(null)
                   setPolling(true)

@@ -1,0 +1,5 @@
+{
+  "deepseek_api_key": "sk-87d9497c46b64268b537522adb8cf0f2",
+  "whisper_model": "mlx-community/whisper-medium-mlx",
+  "deepseek_model": "deepseek-v4-flash"
+}

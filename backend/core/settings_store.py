@@ -1,37 +1,56 @@
-"""用户本地设置（API Key、模型等），仅存于项目目录，不提交 Git"""
+"""用户本地设置（API Key、模型等），存于用户数据目录，不提交 Git"""
 
 import json
 import os
+import shutil
 from pathlib import Path
 
 import config
+from core.paths import BACKEND_DIR, get_data_dir, settings_path
 from core.whisper_models import WHISPER_MODEL_IDS, get_recommended_model_id, options_compatible_with_platform
 
-_SETTINGS_DIR = Path(__file__).resolve().parent.parent / ".local"
-_SETTINGS_FILE = _SETTINGS_DIR / "settings.json"
+_LEGACY_SETTINGS = BACKEND_DIR / ".local" / "settings.json"
+
+
+def _settings_file() -> Path:
+    return settings_path()
 
 
 def _ensure_dir():
-    _SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
+    get_data_dir().mkdir(parents=True, exist_ok=True)
+
+
+def _migrate_legacy_settings() -> None:
+    target = _settings_file()
+    if target.exists() or not _LEGACY_SETTINGS.is_file():
+        return
+    try:
+        shutil.copy2(_LEGACY_SETTINGS, target)
+        os.chmod(target, 0o600)
+    except OSError:
+        pass
 
 
 def _load() -> dict:
-    if not _SETTINGS_FILE.exists():
+    _migrate_legacy_settings()
+    path = _settings_file()
+    if not path.exists():
         return {}
     try:
-        return json.loads(_SETTINGS_FILE.read_text(encoding="utf-8"))
+        return json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
         return {}
 
 
 def _save(data: dict) -> None:
     _ensure_dir()
-    _SETTINGS_FILE.write_text(
+    path = _settings_file()
+    path.write_text(
         json.dumps(data, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
     try:
-        os.chmod(_SETTINGS_FILE, 0o600)
+        os.chmod(path, 0o600)
     except OSError:
         pass
 
@@ -97,8 +116,9 @@ def save_settings(api_key: str, whisper_model: str, deepseek_model: str) -> None
 
 
 def clear_all_settings() -> None:
-    if _SETTINGS_FILE.exists():
-        _SETTINGS_FILE.unlink(missing_ok=True)
+    path = _settings_file()
+    if path.exists():
+        path.unlink(missing_ok=True)
 
 
 def is_api_configured() -> bool:

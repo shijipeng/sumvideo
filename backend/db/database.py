@@ -2,15 +2,16 @@
 
 import sqlite3
 import json
-import os
 from datetime import datetime, timedelta
 
-DB_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "sumvideo.db")
+from core.paths import db_path
 
 
 def get_connection() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(str(db_path()), timeout=30.0)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=30000")
     return conn
 
 
@@ -31,6 +32,8 @@ def init_db():
         )
     """)
     _ensure_column(conn, "videos", "transcript_segments", "TEXT")
+    _ensure_column(conn, "videos", "source_path", "TEXT")
+    _ensure_column(conn, "videos", "error_message", "TEXT")
     conn.commit()
     conn.close()
 
@@ -41,11 +44,16 @@ def _ensure_column(conn: sqlite3.Connection, table: str, column: str, col_type: 
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
 
 
-def insert_video(video_id: str, filename: str, file_hash: str):
+def insert_video(
+    video_id: str,
+    filename: str,
+    file_hash: str,
+    source_path: str | None = None,
+):
     conn = get_connection()
     conn.execute(
-        "INSERT INTO videos (id, filename, file_hash) VALUES (?, ?, ?)",
-        (video_id, filename, file_hash),
+        "INSERT INTO videos (id, filename, file_hash, source_path) VALUES (?, ?, ?, ?)",
+        (video_id, filename, file_hash, source_path),
     )
     conn.commit()
     conn.close()
@@ -56,6 +64,30 @@ def update_status(video_id: str, status: str, progress: float = 0):
     conn.execute(
         "UPDATE videos SET status = ?, progress = ?, updated_at = datetime('now', 'localtime') WHERE id = ?",
         (status, progress, video_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def update_transcript_progress(
+    video_id: str,
+    transcript: str,
+    transcript_segments: list | None = None,
+    progress: float = 82,
+):
+    """转写完成、笔记未生成前写入，避免 88% 僵尸时连转写都看不到。"""
+    conn = get_connection()
+    seg_json = (
+        json.dumps(transcript_segments, ensure_ascii=False)
+        if transcript_segments
+        else None
+    )
+    conn.execute(
+        """UPDATE videos
+           SET status = 'processing', progress = ?, transcript = ?,
+               transcript_segments = ?, updated_at = datetime('now', 'localtime')
+           WHERE id = ?""",
+        (progress, transcript, seg_json, video_id),
     )
     conn.commit()
     conn.close()
@@ -86,12 +118,51 @@ def update_result(
     conn.close()
 
 
-def update_error(video_id: str, error_msg: str):
+def update_error(video_id: str, error_msg: str, *, preserve_transcript: bool = False):
     conn = get_connection()
-    conn.execute(
-        "UPDATE videos SET status = 'error', progress = 0, transcript = ?, updated_at = datetime('now', 'localtime') WHERE id = ?",
-        (error_msg, video_id),
-    )
+    if preserve_transcript:
+        conn.execute(
+            """UPDATE videos
+               SET status = 'error', progress = 0, error_message = ?,
+                   updated_at = datetime('now', 'localtime')
+               WHERE id = ?""",
+            (error_msg, video_id),
+        )
+    else:
+        conn.execute(
+            """UPDATE videos
+               SET status = 'error', progress = 0, error_message = ?, transcript = ?,
+                   updated_at = datetime('now', 'localtime')
+               WHERE id = ?""",
+            (error_msg, error_msg, video_id),
+        )
+    conn.commit()
+    conn.close()
+
+
+def prepare_retry(video_id: str, *, notes_only: bool) -> None:
+    """重试前清理错误态；notes_only 时保留 transcript/segments。"""
+    conn = get_connection()
+    progress = 82.0 if notes_only else 5.0
+    if notes_only:
+        conn.execute(
+            """UPDATE videos
+               SET status = 'processing', progress = ?, error_message = NULL,
+                   chapters = NULL, summary = NULL,
+                   updated_at = datetime('now', 'localtime')
+               WHERE id = ?""",
+            (progress, video_id),
+        )
+    else:
+        conn.execute(
+            """UPDATE videos
+               SET status = 'processing', progress = ?, error_message = NULL,
+                   transcript = NULL, transcript_segments = NULL,
+                   chapters = NULL, summary = NULL,
+                   updated_at = datetime('now', 'localtime')
+               WHERE id = ?""",
+            (progress, video_id),
+        )
     conn.commit()
     conn.close()
 
@@ -142,7 +213,8 @@ def get_all_history() -> list[dict]:
     """按创建时间倒序；同一 file_hash 只保留最新一条（避免强制重传后历史重复）"""
     conn = get_connection()
     rows = conn.execute(
-        """SELECT id, filename, file_hash, status, progress, created_at, updated_at
+        """SELECT id, filename, file_hash, status, progress, created_at, updated_at,
+                  source_path
            FROM videos ORDER BY created_at DESC"""
     ).fetchall()
     conn.close()
@@ -195,8 +267,9 @@ def list_video_ids_by_status(statuses: tuple[str, ...]) -> list[str]:
     return [r[0] for r in rows]
 
 
-def mark_tasks_stale_as_error(max_age_hours: int) -> list[str]:
+def mark_tasks_stale_as_error(max_age_hours: int, error_msg: str | None = None) -> list[str]:
     """将长时间未更新的 pending/processing 标为 error，返回受影响的 id。"""
+    msg = error_msg or "处理超时或中断，请重新上传或从历史中删除"
     cutoff = (datetime.now() - timedelta(hours=max_age_hours)).strftime("%Y-%m-%d %H:%M:%S")
     conn = get_connection()
     rows = conn.execute(
@@ -212,10 +285,54 @@ def mark_tasks_stale_as_error(max_age_hours: int) -> list[str]:
             f"""UPDATE videos
                 SET status = 'error',
                     progress = 0,
-                    transcript = ?,
+                    error_message = ?,
+                    transcript = CASE
+                        WHEN transcript_segments IS NOT NULL
+                             AND transcript IS NOT NULL
+                             AND length(trim(transcript)) > 50
+                        THEN transcript
+                        ELSE ?
+                    END,
                     updated_at = datetime('now', 'localtime')
                 WHERE id IN ({placeholders})""",
-            ("处理超时或中断，请重新上传或从历史中删除", *ids),
+            (msg, msg, *ids),
+        )
+        conn.commit()
+    conn.close()
+    return ids
+
+
+def mark_processing_stale_as_error(max_age_minutes: int, error_msg: str | None = None) -> list[str]:
+    """仅处理 processing：用于后端 reload/崩溃后的 88% 僵尸任务。"""
+    msg = error_msg or (
+        "处理已中断（常见于开发时后端热重载）。请重新上传或从历史删除后重试。"
+    )
+    cutoff = (datetime.now() - timedelta(minutes=max_age_minutes)).strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+    conn = get_connection()
+    rows = conn.execute(
+        """SELECT id FROM videos WHERE status = 'processing' AND updated_at < ?""",
+        (cutoff,),
+    ).fetchall()
+    ids = [r[0] for r in rows]
+    if ids:
+        placeholders = ",".join("?" for _ in ids)
+        conn.execute(
+            f"""UPDATE videos
+                SET status = 'error',
+                    progress = 0,
+                    error_message = ?,
+                    transcript = CASE
+                        WHEN transcript_segments IS NOT NULL
+                             AND transcript IS NOT NULL
+                             AND length(trim(transcript)) > 50
+                        THEN transcript
+                        ELSE ?
+                    END,
+                    updated_at = datetime('now', 'localtime')
+                WHERE id IN ({placeholders})""",
+            (msg, msg, *ids),
         )
         conn.commit()
     conn.close()
