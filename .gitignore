@@ -11,14 +11,22 @@ node_modules/
 dist/
 .next/
 
-# Uploads & local DB
+# Uploads & local data（本机运行时产生，不进仓库）
 uploads/
 audio/
 backend/uploads/
-backend/sumvideo.db
+backend/audio/
 
-# 用户本地配置（含 API Key）
+# SQLite 数据库及 WAL/SHM 伴生文件
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+
+# 用户本地配置（含 API Key；桌面/Web 数据目录下的 settings.json）
 backend/.local/
+backend/settings.json
+settings.json
 
 # Whisper 模型文件（体积大，仅本机）
 backend/models/
