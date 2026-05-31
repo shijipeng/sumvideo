@@ -33,6 +33,7 @@ def init_db():
     """)
     _ensure_column(conn, "videos", "transcript_segments", "TEXT")
     _ensure_column(conn, "videos", "source_path", "TEXT")
+    _ensure_column(conn, "videos", "source_url", "TEXT")
     _ensure_column(conn, "videos", "error_message", "TEXT")
     conn.commit()
     conn.close()
@@ -49,11 +50,32 @@ def insert_video(
     filename: str,
     file_hash: str,
     source_path: str | None = None,
+    source_url: str | None = None,
 ):
     conn = get_connection()
     conn.execute(
-        "INSERT INTO videos (id, filename, file_hash, source_path) VALUES (?, ?, ?, ?)",
-        (video_id, filename, file_hash, source_path),
+        "INSERT INTO videos (id, filename, file_hash, source_path, source_url) VALUES (?, ?, ?, ?, ?)",
+        (video_id, filename, file_hash, source_path, source_url),
+    )
+    conn.commit()
+    conn.close()
+
+
+def update_file_hash(video_id: str, file_hash: str) -> None:
+    conn = get_connection()
+    conn.execute(
+        "UPDATE videos SET file_hash = ?, updated_at = datetime('now', 'localtime') WHERE id = ?",
+        (file_hash, video_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def update_filename(video_id: str, filename: str) -> None:
+    conn = get_connection()
+    conn.execute(
+        "UPDATE videos SET filename = ?, updated_at = datetime('now', 'localtime') WHERE id = ?",
+        (filename, video_id),
     )
     conn.commit()
     conn.close()
@@ -207,6 +229,34 @@ def find_by_hash(file_hash: str) -> dict | None:
     if result.get("transcript_segments"):
         result["transcript_segments"] = json.loads(result["transcript_segments"])
     return result
+
+
+def find_by_source_url(source_url: str) -> dict | None:
+    conn = get_connection()
+    row = conn.execute(
+        """SELECT * FROM videos WHERE source_url = ? AND status = 'done'
+           ORDER BY created_at DESC LIMIT 1""",
+        (source_url,),
+    ).fetchone()
+    conn.close()
+    if row is None:
+        return None
+    result = dict(row)
+    if result.get("chapters"):
+        result["chapters"] = json.loads(result["chapters"])
+    if result.get("transcript_segments"):
+        result["transcript_segments"] = json.loads(result["transcript_segments"])
+    return result
+
+
+def list_ids_by_source_url(source_url: str) -> list[str]:
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT id FROM videos WHERE source_url = ? ORDER BY created_at DESC",
+        (source_url,),
+    ).fetchall()
+    conn.close()
+    return [r[0] for r in rows]
 
 
 def get_all_history() -> list[dict]:

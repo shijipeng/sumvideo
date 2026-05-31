@@ -21,6 +21,7 @@ sumvideo/
 | Python 3.10+ | 后端 | `python3 --version` |
 | Node.js 20+ | 前端（项目使用 Vite 5，兼容 20.17） | `node --version` |
 | ffmpeg | 从视频提取音频 | `ffmpeg -version` |
+| yt-dlp | 在线 URL 导入（字幕/下载） | `backend/.venv/bin/yt-dlp --version` |
 
 > **Whisper 转写**：Mac M 系列用 **mlx-whisper**（默认 **Medium MLX**）；Windows / Linux / Intel Mac 用 **faster-whisper**（默认 **medium**）。模型下载到用户数据目录下的 **`models/`**（Web 开发时默认为 `backend/models/`，已 gitignore）。
 
@@ -77,8 +78,8 @@ npm install
 
 ## 使用说明
 
-1. 完成初始设置后，选择本地视频文件
-2. 浏览器本地播放视频，同时上传到后端转写
+1. 完成初始设置后，选择本地视频文件，或粘贴 B 站 / YouTube 等视频链接导入
+2. 浏览器本地播放视频（本地上传时），同时上传到后端转写；URL 导入则下载完成后播放
 3. 等待进度条完成，查看章节与 AI 总结
 4. 点击章节可跳转播放；播放时自动高亮当前章节
 5. 支持导出 `summary.md`、历史记录与重复视频提示
@@ -94,6 +95,7 @@ Electron 应用、与 Web 统一的上传与播放流程、内嵌 Python 构建�
 | 方法 | 路径 | 说明 |
 |------|------|------|
 | POST | `/api/upload?force=true` | 上传视频（Web 与桌面统一） |
+| POST | `/api/import-url` | 在线 URL 导入（字幕优先，无 Cookie） |
 | POST | `/api/process-path` | 已废弃（410），请使用 `/api/upload` |
 | GET | `/api/status/{id}` | 查询进度与结果 |
 | GET | `/api/history` | 历史列表 |

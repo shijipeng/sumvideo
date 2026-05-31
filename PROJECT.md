@@ -1,6 +1,6 @@
 # SumVideo — 项目说明与技术选型
 
-本地 AI 视频笔记工具：上传本地视频 → Whisper 转写 → DeepSeek 生成结构化笔记 → 可点击跳转播放、思维导图、导出 Markdown。
+本地 AI 视频笔记工具：本地上传或在线 URL 导入 → Whisper 转写（有字幕则跳过）→ DeepSeek 生成结构化笔记 → 可点击跳转播放、思维导图、导出 Markdown。
 
 ---
 
@@ -11,14 +11,15 @@
 | **形态** | 本机运行的 Web 应用（浏览器 + 本地后端） |
 | **隐私** | 视频与转写在本机处理；仅总结阶段调用 DeepSeek API |
 | **典型用户** | 学习/复盘长视频，需要带时间轴的章节笔记与导图 |
-| **非目标** | 在线视频网站抓取、多用户 SaaS、移动端 App（当前未做） |
+| **非目标** | Cookie 登录态、多用户 SaaS、移动端 App（当前未做） |
 
 ---
 
 ## 2. 功能清单
 
 - **上传与处理**：支持常见视频格式；SHA256 去重；重复时可「使用已有结果」或「重新处理」
-- **转写**：本地 Whisper（Mac M 系 MLX / 其它平台 faster-whisper）
+- **在线 URL 导入**：粘贴链接 → yt-dlp 拉字幕 + 下载到 `uploads/`；有合格 CC 字幕则跳过 Whisper；URL 级查重
+- **转写**：本地 Whisper（Mac M 系 MLX / 其它平台 faster-whisper）；无在线字幕时 fallback
 - **笔记（方案 B）**：一次 LLM 调用生成 `overview` + 多段 `sections`（含 `title`、`start_time`、`lead`、`points`）
 - **转写句段**：`transcript_segments` 按章节分组展示，点击跳转
 - **播放**：原生 `<video>`；章节标题行跳转；方向键快进/倍速；处理完成后可流式播放 `GET /api/video/{id}`
@@ -51,13 +52,20 @@
 └───────────────┘              └──────────────────┘
 ```
 
-**单视频处理流程**
+**单视频处理流程（本地上传）**
 
 1. 上传 → 存 `uploads/{id}.ext`，写入 DB（`pending`）
 2. `ffmpeg` 提取 16kHz 单声道 WAV
 3. 本地 Whisper 转写 → `transcript` + `transcript_segments`
 4. DeepSeek `generate_notes()` → `summary`(overview) + `chapters`(sections)
 5. 状态 `done`，前端轮询 `/api/status/{id}` 展示结果
+
+**在线 URL 导入流程**
+
+1. `POST /api/import-url` → 写入 DB（`source_url`、占位 `file_hash`）→ 立即返回 `task_id`
+2. 后台：yt-dlp 拉字幕（progress &lt; 8）→ 下载视频到 `uploads/`（8–20）
+3. 有合格字幕 → 直接 DeepSeek 笔记；否则 Whisper + 笔记
+4. 播放仍走 `GET /api/video/{id}`
 
 **每个视频 API 调用次数**：Whisper 本地 0 次计费；DeepSeek **1 次**（仅笔记生成）。
 
@@ -78,6 +86,8 @@ sumvideo/
 │   ├── requirements.txt
 │   ├── core/
 │   │   ├── transcriber.py  # ffmpeg + MLX / faster-whisper
+│   │   ├── url_importer.py # 在线 URL 校验、probe、下载
+│   │   ├── subtitle_fetcher.py # yt-dlp 字幕拉取与解析
 │   │   ├── summarizer.py   # DeepSeek 结构化笔记
 │   │   ├── whisper_models.py
 │   │   ├── settings_store.py
@@ -271,6 +281,7 @@ npm run frontend  # http://localhost:5173
 | POST | `/api/settings` | 保存 Key 与模型 |
 | DELETE | `/api/settings` | 清除配置 |
 | POST | `/api/upload?force=false` | 上传；`force=true` 替换同哈希旧任务 |
+| POST | `/api/import-url` | 在线 URL 导入；`force=true` 替换同 URL 旧任务 |
 | GET | `/api/status/{id}` | 进度与结果 |
 | GET | `/api/video/{id}` | 视频流（处理后仍保留在 uploads） |
 | GET | `/api/history` | 历史（按 file_hash 去重展示） |

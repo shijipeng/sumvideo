@@ -105,6 +105,19 @@ export async function uploadVideo(file: File, force = false): Promise<UploadResp
   return res.json()
 }
 
+export async function importVideoUrl(url: string, force = false): Promise<UploadResponse> {
+  const res = await fetch(apiUrl('/api/import-url'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ url, force }),
+  })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}))
+    throw new Error(parseApiError(err, `导入失败 (HTTP ${res.status})`))
+  }
+  return res.json()
+}
+
 export async function getStatus(taskId: string): Promise<VideoStatus> {
   // 处理中长视频时后端忙于转写/DeepSeek，轮询放宽超时
   const res = await fetchWithTimeout(apiUrl(`/api/status/${taskId}`), undefined, 60_000)

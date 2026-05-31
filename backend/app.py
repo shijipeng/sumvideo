@@ -64,6 +64,13 @@ from core.storage_cleanup import (
 from core.video_paths import resolve_video_path
 from core.paths import upload_dir as paths_upload_dir
 from core.task_resume import video_error_message, video_has_resumable_transcript
+from core.url_importer import (
+    validate_url_safe,
+    normalize_url,
+    probe_video,
+    download_video,
+)
+from core.subtitle_fetcher import try_fetch_subtitles, SubtitleResult
 from db.database import (
     init_db,
     insert_video,
@@ -74,7 +81,11 @@ from db.database import (
     prepare_retry,
     get_video,
     find_by_hash,
+    find_by_source_url,
     list_ids_by_hash,
+    list_ids_by_source_url,
+    update_file_hash,
+    update_filename,
     get_all_history,
     mark_processing_stale_as_error,
 )
@@ -143,6 +154,10 @@ def compute_file_hash(file_path: str) -> str:
     return sha256.hexdigest()
 
 
+def _pending_url_hash(normalized_url: str) -> str:
+    return "pending:" + hashlib.sha256(normalized_url.encode("utf-8")).hexdigest()
+
+
 async def _run_notes_stage(
     video_id: str,
     transcript_text: str,
@@ -209,6 +224,7 @@ async def process_video(
     file_ext: str,
     *,
     notes_only: bool = False,
+    min_progress: float = 5,
 ):
     """后台处理视频：转写 + 总结；notes_only 时跳过 Whisper 仅用已存转写。"""
     import logging
@@ -231,10 +247,10 @@ async def process_video(
             update_status(video_id, "processing", 82)
             log.info("任务 %s 断点续跑：跳过转写，直接生成笔记", video_id)
         else:
-            update_status(video_id, "processing", 5)
+            update_status(video_id, "processing", min_progress)
 
             def progress_callback(percent: int, message: str = ""):
-                progress = min(80, max(5, percent))
+                progress = min(80, max(min_progress, percent))
 
                 def _write():
                     update_status(video_id, "processing", progress)
@@ -273,6 +289,83 @@ async def process_video(
                 f"然后重新上传或点「重新处理」。原始信息: {e}"
             )
         update_error(video_id, error_msg, preserve_transcript=transcript_saved)
+        on_processing_failed(video_id)
+
+
+async def _import_url_task(
+    video_id: str,
+    url: str,
+    normalized_url: str,
+    title: str,
+    force: bool,
+) -> None:
+    subs: SubtitleResult | None = None
+    temp_path: str | None = None
+    loop = asyncio.get_running_loop()
+    notes_timeout = float(getattr(config, "NOTES_STAGE_TIMEOUT_SEC", 360))
+    transcript_saved = False
+
+    try:
+        update_status(video_id, "processing", 2)
+        subs = await loop.run_in_executor(None, lambda: try_fetch_subtitles(url))
+
+        def on_dl_progress(p: float) -> None:
+            update_status(video_id, "processing", p)
+
+        update_status(video_id, "processing", 10)
+        path = await loop.run_in_executor(
+            None,
+            lambda: download_video(url, UPLOAD_DIR, on_dl_progress),
+        )
+        temp_path = str(path)
+        ext = path.suffix.lower()
+        if ext not in ALLOWED_VIDEO_EXTENSIONS:
+            ext = ".mp4"
+            new_path = path.with_suffix(".mp4")
+            if new_path != path:
+                shutil.move(str(path), str(new_path))
+                path = new_path
+                temp_path = str(path)
+
+        file_hash = compute_file_hash(temp_path)
+        if not force:
+            existing = find_by_hash(file_hash)
+            if existing and existing["id"] != video_id:
+                os.remove(temp_path)
+                update_error(video_id, "与已有本地文件重复")
+                on_processing_failed(video_id)
+                return
+
+        if force:
+            for old_id in list_ids_by_hash(file_hash):
+                if old_id != video_id:
+                    purge_video_record(old_id)
+
+        final_path = str(UPLOAD_DIR / f"{video_id}{ext}")
+        shutil.move(temp_path, final_path)
+        temp_path = None
+
+        update_file_hash(video_id, file_hash)
+        update_filename(video_id, title)
+
+        if subs:
+            update_transcript_progress(
+                video_id, subs.transcript_text, subs.segments, progress=82
+            )
+            transcript_saved = True
+            await _run_notes_stage(
+                video_id, subs.transcript_text, subs.segments, loop, notes_timeout
+            )
+        else:
+            await process_video(video_id, final_path, ext, min_progress=21)
+
+    except Exception as e:
+        if temp_path and os.path.isfile(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+        update_error(video_id, str(e), preserve_transcript=transcript_saved)
         on_processing_failed(video_id)
 
 
@@ -521,6 +614,75 @@ async def upload_video(
     return {"task_id": video_id, "duplicate": False}
 
 
+class ImportUrlBody(BaseModel):
+    url: str
+    force: bool = False
+
+
+def _require_fully_ready_for_import():
+    if not is_fully_ready():
+        if not is_settings_ready():
+            raise HTTPException(
+                400,
+                "请先完成设置：填写 DeepSeek API Key 并选择 Whisper 模型",
+            )
+        raise HTTPException(400, "请先下载所选 Whisper 模型后再导入视频")
+
+
+@app.post("/api/import-url")
+async def import_url_video(body: ImportUrlBody):
+    """从在线 URL 导入：字幕优先跳过 Whisper，否则下载后 Whisper 转写。"""
+    _require_fully_ready_for_import()
+
+    raw = (body.url or "").strip()
+    if not raw:
+        raise HTTPException(400, "链接不能为空")
+
+    try:
+        validate_url_safe(raw)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    except Exception as e:
+        raise HTTPException(400, f"链接无效: {e}") from e
+
+    normalized = normalize_url(raw)
+    if not normalized:
+        raise HTTPException(400, "链接无效")
+
+    if not body.force:
+        existing = find_by_source_url(normalized)
+        if existing:
+            return {
+                "duplicate": True,
+                "existing": {
+                    "id": existing["id"],
+                    "filename": existing["filename"],
+                    "created_at": existing["created_at"],
+                },
+                "message": "该链接已处理过，是否使用已有结果？",
+            }
+
+    if body.force:
+        for old_id in list_ids_by_source_url(normalized):
+            purge_video_record(old_id)
+
+    try:
+        info = probe_video(raw)
+        title = info.get("title") or "在线视频"
+    except Exception as e:
+        raise HTTPException(400, f"无法解析视频信息: {e}") from e
+
+    video_id = uuid.uuid4().hex
+    pending_hash = _pending_url_hash(normalized)
+    insert_video(video_id, title, pending_hash, source_url=normalized)
+
+    asyncio.create_task(
+        _import_url_task(video_id, raw, normalized, title, body.force)
+    )
+
+    return {"task_id": video_id, "duplicate": False}
+
+
 @app.post("/api/process-path", deprecated=True)
 async def process_path_video(_body: ProcessPathBody):
     """已废弃：请使用 POST /api/upload 上传视频到 uploads/。"""
@@ -533,8 +695,10 @@ async def process_path_video(_body: ProcessPathBody):
 def _progress_message(progress: float, status: str) -> str:
     if status != "processing":
         return ""
-    if progress < 15:
-        return "准备转写…"
+    if progress < 8:
+        return "正在获取字幕…"
+    if progress < 20:
+        return "正在下载视频…"
     if progress < 82:
         return "正在 Whisper 转写…"
     if progress < 95:

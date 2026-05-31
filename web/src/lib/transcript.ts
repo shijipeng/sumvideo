@@ -6,6 +6,53 @@ export interface TranscriptGroup {
   items: TranscriptSegment[]
 }
 
+export interface MergeTranscriptOptions {
+  maxChars?: number
+  maxDurationSec?: number
+  maxGapSec?: number
+}
+
+const DEFAULT_MERGE_OPTS: Required<MergeTranscriptOptions> = {
+  maxChars: 120,
+  maxDurationSec: 45,
+  maxGapSec: 2,
+}
+
+/** 展示层合并相邻句段为自然段（不影响存储） */
+export function mergeTranscriptSegments(
+  segments: TranscriptSegment[],
+  opts?: MergeTranscriptOptions,
+): TranscriptSegment[] {
+  if (!segments.length) return []
+
+  const { maxChars, maxDurationSec, maxGapSec } = { ...DEFAULT_MERGE_OPTS, ...opts }
+  const sorted = [...segments].sort((a, b) => a.start_time - b.start_time)
+  const result: TranscriptSegment[] = []
+
+  let current: TranscriptSegment = { ...sorted[0] }
+
+  for (let i = 1; i < sorted.length; i++) {
+    const next = sorted[i]
+    const gap = next.start_time - current.end_time
+    const mergedText = current.text + next.text
+    const mergedDuration = next.end_time - current.start_time
+
+    if (gap <= maxGapSec && mergedText.length <= maxChars && mergedDuration <= maxDurationSec) {
+      current = {
+        start_time: current.start_time,
+        end_time: Math.max(current.end_time, next.end_time),
+        text: mergedText,
+      }
+    } else {
+      result.push(current)
+      current = { ...next }
+    }
+  }
+
+  result.push(current)
+  return result
+}
+
 /** 按笔记章节时间范围聚合 Whisper 转写句段 */
 export function groupTranscriptBySections(
   segments: TranscriptSegment[],

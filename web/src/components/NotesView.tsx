@@ -1,5 +1,5 @@
 import { stripNoteLabel } from '../lib/noteText'
-import { groupTranscriptBySections, formatTime } from '../lib/transcript'
+import { groupTranscriptBySections, mergeTranscriptSegments, formatTime } from '../lib/transcript'
 import type { NoteSection, TranscriptSegment } from '../types'
 
 interface Props {
@@ -34,7 +34,7 @@ export function NotesView({
       <div className="space-y-4 text-sm leading-relaxed text-[var(--sv-fg)]">
         <div className="whitespace-pre-wrap">{legacySummary}</div>
         {sections.length > 0 && (
-          <SectionList
+          <SectionNotesBlock
             sections={sections}
             activeIndex={activeIndex}
             onSectionSelect={onSectionSelect}
@@ -64,16 +64,11 @@ export function NotesView({
       )}
 
       {sections.length > 0 && (
-        <section>
-          <h3 className="mb-2 text-xs font-semibold uppercase tracking-wider text-[var(--sv-fg-muted)]">
-            分段笔记
-          </h3>
-          <SectionList
-            sections={sections}
-            activeIndex={activeIndex}
-            onSectionSelect={onSectionSelect}
-          />
-        </section>
+        <SectionNotesBlock
+          sections={sections}
+          activeIndex={activeIndex}
+          onSectionSelect={onSectionSelect}
+        />
       )}
 
       {transcript && (
@@ -85,6 +80,36 @@ export function NotesView({
         />
       )}
     </div>
+  )
+}
+
+function SectionNotesBlock({
+  sections,
+  activeIndex,
+  onSectionSelect,
+}: {
+  sections: NoteSection[]
+  activeIndex: number
+  onSectionSelect: (section: NoteSection, index: number) => void
+}) {
+  return (
+    <details open className="group/notes">
+      <summary className="mb-2 flex cursor-pointer list-none items-center gap-1.5 text-xs font-semibold uppercase tracking-wider text-[var(--sv-fg-muted)] [&::-webkit-details-marker]:hidden">
+        <span
+          aria-hidden
+          className="text-[10px] transition-transform group-open/notes:rotate-90"
+        >
+          ▶
+        </span>
+        分段笔记
+        <span className="font-normal normal-case tracking-normal">（{sections.length} 段）</span>
+      </summary>
+      <SectionList
+        sections={sections}
+        activeIndex={activeIndex}
+        onSectionSelect={onSectionSelect}
+      />
+    </details>
   )
 }
 
@@ -155,7 +180,12 @@ function TranscriptBlock({
 }) {
   const segments = transcriptSegments ?? []
   const hasSegments = segments.length > 0
-  const groups = hasSegments ? groupTranscriptBySections(segments, sections) : []
+  const groups = hasSegments
+    ? groupTranscriptBySections(segments, sections).map((group) => ({
+        ...group,
+        items: mergeTranscriptSegments(group.items),
+      }))
+    : []
 
   return (
     <details className="rounded-lg border border-[var(--sv-border)] bg-[var(--sv-canvas)]">
@@ -163,7 +193,7 @@ function TranscriptBlock({
         查看完整转写文本
         {hasSegments && (
           <span className="ml-2 text-xs text-[var(--sv-fg-muted)]">
-            （{sections.length ? '按章节' : '按句'}分段，点击跳转）
+            （{sections.length ? '按章节内段落' : '按段落'}，点击跳转）
           </span>
         )}
       </summary>

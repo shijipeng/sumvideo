@@ -4,6 +4,7 @@ import { ModelDownloadGate } from './components/ModelDownloadGate'
 import { MindMapView } from './components/MindMapView'
 import { NotesView } from './components/NotesView'
 import { SetupGate } from './components/SetupGate'
+import { ImportUrlField } from './components/ImportUrlField'
 import { UploadButton } from './components/UploadButton'
 import { VideoPlayer, type VideoPlayerHandle } from './components/VideoPlayer'
 import { useTaskPolling } from './hooks/useTaskPolling'
@@ -17,6 +18,7 @@ import {
   getStatus,
   retryVideo,
   uploadVideo,
+  importVideoUrl,
   videoStreamUrl,
 } from './lib/api'
 import { pickVideoFile, readVideoAsFile } from './lib/runtime'
@@ -152,6 +154,7 @@ function MainWorkspace({
   const [taskId, setTaskId] = useState<string | null>(null)
   const [polling, setPolling] = useState(false)
   const [uploading, setUploading] = useState(false)
+  const [importing, setImporting] = useState(false)
   const [history, setHistory] = useState<HistoryItem[]>([])
   const [loadedResult, setLoadedResult] = useState<VideoStatus | null>(null)
   const [activeSectionIndex, setActiveSectionIndex] = useState(-1)
@@ -160,6 +163,7 @@ function MainWorkspace({
   const [rightTab, setRightTab] = useState<'notes' | 'mindmap'>('notes')
   const [duplicateModal, setDuplicateModal] = useState<{
     file?: File
+    url?: string
     existingId: string
     filename: string
   } | null>(null)
@@ -183,9 +187,11 @@ function MainWorkspace({
 
   const videoSrc = useMemo(() => {
     if (localVideoUrl) return localVideoUrl
-    if (taskId) return videoStreamUrl(taskId)
+    if (!taskId) return null
+    const status = pollStatus?.status ?? loadedResult?.status
+    if (status === 'done') return videoStreamUrl(taskId)
     return null
-  }, [localVideoUrl, taskId])
+  }, [localVideoUrl, taskId, pollStatus?.status, loadedResult?.status])
 
   const refreshHistory = useCallback(async () => {
     try {
@@ -228,11 +234,12 @@ function MainWorkspace({
 
   const startProcessing = async (
     res: Awaited<ReturnType<typeof uploadVideo>>,
-    file?: File,
+    opts?: { file?: File; url?: string },
   ) => {
     if (res.duplicate && res.existing) {
       setDuplicateModal({
-        file,
+        file: opts?.file,
+        url: opts?.url,
         existingId: res.existing.id,
         filename: res.existing.filename,
       })
@@ -256,7 +263,7 @@ function MainWorkspace({
 
     try {
       const res = await uploadVideo(file, force)
-      await startProcessing(res, file)
+      await startProcessing(res, { file })
     } catch (e) {
       const msg = formatUnknownError(e, '上传失败')
       setError(msg)
@@ -279,6 +286,26 @@ function MainWorkspace({
     } catch (e) {
       setError(formatUnknownError(e, '读取视频失败'))
       console.error('[SumVideo] 读取视频失败', e)
+    }
+  }
+
+  const handleUrlImport = async (url: string, force = false) => {
+    setError(null)
+    if (localVideoUrl?.startsWith('blob:')) URL.revokeObjectURL(localVideoUrl)
+    setLocalVideoUrl(null)
+    setLocalFile(null)
+    setLoadedResult(null)
+    setImporting(true)
+
+    try {
+      const res = await importVideoUrl(url, force)
+      await startProcessing(res, { url })
+    } catch (e) {
+      const msg = formatUnknownError(e, '导入失败')
+      setError(msg)
+      console.error('[SumVideo] URL 导入失败', e)
+    } finally {
+      setImporting(false)
     }
   }
 
@@ -374,8 +401,13 @@ function MainWorkspace({
         <div className="flex flex-wrap items-center gap-2">
           <UploadButton
             onSelect={(f) => handleVideoSelect(f)}
-            disabled={uploading || isProcessing}
+            disabled={uploading || importing || isProcessing}
             uploading={uploading}
+          />
+          <ImportUrlField
+            onImport={handleUrlImport}
+            disabled={uploading || importing || isProcessing}
+            importing={importing}
           />
           <button
             type="button"
@@ -595,11 +627,15 @@ function MainWorkspace({
                 type="button"
                 className="flex-1 rounded-lg border border-[var(--sv-border)] px-4 py-2 text-sm text-[var(--sv-fg)] hover:bg-[var(--sv-canvas-subtle)]"
                 onClick={async () => {
-                  const { existingId, file } = duplicateModal
+                  const { existingId, file, url } = duplicateModal
                   setDuplicateModal(null)
                   if (localVideoUrl?.startsWith('blob:')) {
                     URL.revokeObjectURL(localVideoUrl)
                     setLocalVideoUrl(null)
+                  }
+                  if (url) {
+                    await handleUrlImport(url, true)
+                    return
                   }
                   if (file) {
                     setLocalFile(file)
