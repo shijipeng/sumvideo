@@ -35,8 +35,27 @@ def init_db():
     _ensure_column(conn, "videos", "source_path", "TEXT")
     _ensure_column(conn, "videos", "source_url", "TEXT")
     _ensure_column(conn, "videos", "error_message", "TEXT")
+    _ensure_column(conn, "videos", "notes_meta", "TEXT")
+    _ensure_column(conn, "videos", "frame_status", "TEXT DEFAULT 'pending'")
+    _ensure_column(conn, "videos", "frame_error_message", "TEXT")
+    _ensure_column(conn, "videos", "frame_progress_done", "INTEGER DEFAULT 0")
+    _ensure_column(conn, "videos", "frame_progress_total", "INTEGER DEFAULT 0")
     conn.commit()
     conn.close()
+
+
+def _parse_video_row(result: dict) -> dict:
+    if result.get("chapters"):
+        result["chapters"] = json.loads(result["chapters"])
+    if result.get("transcript_segments"):
+        result["transcript_segments"] = json.loads(result["transcript_segments"])
+    raw_meta = result.get("notes_meta")
+    if raw_meta and isinstance(raw_meta, str):
+        try:
+            result["notes_meta"] = json.loads(raw_meta)
+        except json.JSONDecodeError:
+            result["notes_meta"] = None
+    return result
 
 
 def _ensure_column(conn: sqlite3.Connection, table: str, column: str, col_type: str):
@@ -121,6 +140,9 @@ def update_result(
     chapters: list,
     summary: str,
     transcript_segments: list | None = None,
+    *,
+    notes_meta: dict | None = None,
+    frame_status: str = "pending",
 ):
     conn = get_connection()
     seg_json = (
@@ -128,13 +150,58 @@ def update_result(
         if transcript_segments
         else None
     )
+    meta_json = json.dumps(notes_meta, ensure_ascii=False) if notes_meta else None
     conn.execute(
         """UPDATE videos
            SET status = 'done', progress = 100, transcript = ?,
                chapters = ?, summary = ?, transcript_segments = ?,
+               notes_meta = ?, frame_status = ?,
+               frame_error_message = NULL,
+               frame_progress_done = 0, frame_progress_total = 0,
                updated_at = datetime('now', 'localtime')
            WHERE id = ?""",
-        (transcript, json.dumps(chapters, ensure_ascii=False), summary, seg_json, video_id),
+        (
+            transcript,
+            json.dumps(chapters, ensure_ascii=False),
+            summary,
+            seg_json,
+            meta_json,
+            frame_status,
+            video_id,
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+
+def update_chapters_frames(video_id: str, chapters: list) -> None:
+    conn = get_connection()
+    conn.execute(
+        """UPDATE videos SET chapters = ?,
+           updated_at = datetime('now', 'localtime')
+           WHERE id = ?""",
+        (json.dumps(chapters, ensure_ascii=False), video_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def update_frame_status(
+    video_id: str,
+    status: str,
+    progress_done: int,
+    progress_total: int,
+    *,
+    error_msg: str | None = None,
+) -> None:
+    conn = get_connection()
+    conn.execute(
+        """UPDATE videos
+           SET frame_status = ?, frame_progress_done = ?, frame_progress_total = ?,
+               frame_error_message = ?,
+               updated_at = datetime('now', 'localtime')
+           WHERE id = ?""",
+        (status, progress_done, progress_total, error_msg, video_id),
     )
     conn.commit()
     conn.close()
@@ -162,6 +229,34 @@ def update_error(video_id: str, error_msg: str, *, preserve_transcript: bool = F
     conn.close()
 
 
+def prepare_retry_frames_only(video_id: str) -> None:
+    """仅重跑配图：保留 transcript、summary、notes_meta 与章节文字。"""
+    row = get_video(video_id)
+    if not row:
+        return
+    chapters = row.get("chapters") or []
+    cleaned = []
+    for sec in chapters:
+        if not isinstance(sec, dict):
+            continue
+        s = dict(sec)
+        s.pop("frames", None)
+        s.pop("thumbnail", None)
+        cleaned.append(s)
+    conn = get_connection()
+    conn.execute(
+        """UPDATE videos
+           SET frame_status = 'pending', frame_error_message = NULL,
+               frame_progress_done = 0, frame_progress_total = 0,
+               chapters = ?,
+               updated_at = datetime('now', 'localtime')
+           WHERE id = ?""",
+        (json.dumps(cleaned, ensure_ascii=False), video_id),
+    )
+    conn.commit()
+    conn.close()
+
+
 def prepare_retry(video_id: str, *, notes_only: bool) -> None:
     """重试前清理错误态；notes_only 时保留 transcript/segments。"""
     conn = get_connection()
@@ -170,7 +265,9 @@ def prepare_retry(video_id: str, *, notes_only: bool) -> None:
         conn.execute(
             """UPDATE videos
                SET status = 'processing', progress = ?, error_message = NULL,
-                   chapters = NULL, summary = NULL,
+                   chapters = NULL, summary = NULL, notes_meta = NULL,
+                   frame_status = 'pending', frame_error_message = NULL,
+                   frame_progress_done = 0, frame_progress_total = 0,
                    updated_at = datetime('now', 'localtime')
                WHERE id = ?""",
             (progress, video_id),
@@ -195,12 +292,7 @@ def get_video(video_id: str) -> dict | None:
     conn.close()
     if row is None:
         return None
-    result = dict(row)
-    if result.get("chapters"):
-        result["chapters"] = json.loads(result["chapters"])
-    if result.get("transcript_segments"):
-        result["transcript_segments"] = json.loads(result["transcript_segments"])
-    return result
+    return _parse_video_row(dict(row))
 
 
 def list_ids_by_hash(file_hash: str) -> list[str]:
@@ -223,12 +315,7 @@ def find_by_hash(file_hash: str) -> dict | None:
     conn.close()
     if row is None:
         return None
-    result = dict(row)
-    if result.get("chapters"):
-        result["chapters"] = json.loads(result["chapters"])
-    if result.get("transcript_segments"):
-        result["transcript_segments"] = json.loads(result["transcript_segments"])
-    return result
+    return _parse_video_row(dict(row))
 
 
 def find_by_source_url(source_url: str) -> dict | None:
@@ -241,12 +328,7 @@ def find_by_source_url(source_url: str) -> dict | None:
     conn.close()
     if row is None:
         return None
-    result = dict(row)
-    if result.get("chapters"):
-        result["chapters"] = json.loads(result["chapters"])
-    if result.get("transcript_segments"):
-        result["transcript_segments"] = json.loads(result["transcript_segments"])
-    return result
+    return _parse_video_row(dict(row))
 
 
 def list_ids_by_source_url(source_url: str) -> list[str]:

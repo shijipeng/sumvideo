@@ -20,8 +20,10 @@ sumvideo/
 |------|------|----------|
 | Python 3.10+ | 后端 | `python3 --version` |
 | Node.js 20+ | 前端（项目使用 Vite 5，兼容 20.17） | `node --version` |
-| ffmpeg | 从视频提取音频 | `ffmpeg -version` |
+| ffmpeg | 从视频提取音频、配图截帧 | `ffmpeg -version` |
 | yt-dlp | 在线 URL 导入（字幕/下载） | `backend/.venv/bin/yt-dlp --version` |
+| scenedetect | 镜头切换检测（配图事件源） | `pip show scenedetect` |
+| tesseract（可选） | 录屏类 OCR 事件源 | 系统安装 + `pip install pytesseract` |
 
 > **Whisper 转写**：Mac M 系列用 **mlx-whisper**（默认 **Medium MLX**）；Windows / Linux / Intel Mac 用 **faster-whisper**（默认 **medium**）。模型下载到用户数据目录下的 **`models/`**（Web 开发时默认为 `backend/models/`，已 gitignore）。
 
@@ -80,9 +82,20 @@ npm install
 
 1. 完成初始设置后，选择本地视频文件，或粘贴 B 站 / YouTube 等视频链接导入
 2. 浏览器本地播放视频（本地上传时），同时上传到后端转写；URL 导入则下载完成后播放
-3. 等待进度条完成，查看章节与 AI 总结
+3. 文字笔记完成后即可阅读；图文 Tab 在配图异步完成后自动刷新（或点「重新生成配图」）
 4. 点击章节可跳转播放；播放时自动高亮当前章节
-5. 支持导出 `summary.md`、历史记录与重复视频提示
+5. 支持导出笔记 Markdown、思维导图、历史记录与重复视频提示
+
+**重试选项**（`POST /api/retry/{id}?from_stage=`）：
+
+| from_stage | 说明 |
+|------------|------|
+| `auto` | 有转写则跳过 Whisper，仅笔记 |
+| `notes_only` | 仅重跑 DeepSeek 笔记（保留转写） |
+| `frames_only` | 仅重跑本地配图（保留笔记与 meta） |
+| `full` | 从头转写 + 笔记 + 配图 |
+
+环境变量（可选）：`SUMVIDEO_OCR=0` 关闭 OCR；`SUMVIDEO_FRAME_DENSITY=compact|standard|detailed` 调节配图密度。
 
 ## 桌面端
 
@@ -97,7 +110,9 @@ Electron 应用、与 Web 统一的上传与播放流程、内嵌 Python 构建�
 | POST | `/api/upload?force=true` | 上传视频（Web 与桌面统一） |
 | POST | `/api/import-url` | 在线 URL 导入（字幕优先，无 Cookie） |
 | POST | `/api/process-path` | 已废弃（410），请使用 `/api/upload` |
-| GET | `/api/status/{id}` | 查询进度与结果 |
+| GET | `/api/status/{id}` | 查询进度与结果（含 `notes_meta`、`frame_status`） |
+| GET | `/api/video/{id}/thumb/{section}/{frame}` | 章节配图 JPEG（多图） |
+| GET | `/api/video/{id}/thumb/{index}` | 章节配图 JPEG（兼容旧版） |
 | GET | `/api/history` | 历史列表 |
 | DELETE | `/api/history/{id}` | 删除记录 |
-| POST | `/api/retry/{id}` | 重新处理（uploads 副本或 source_path 原文件须存在） |
+| POST | `/api/retry/{id}?from_stage=` | 重新处理（`auto`/`full`/`notes_only`/`frames_only`） |

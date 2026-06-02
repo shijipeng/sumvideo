@@ -50,3 +50,9 @@ STALE_TASK_HOURS = 48
 STALE_PROCESSING_MINUTES = 15
 # DeepSeek 笔记阶段 asyncio 兜底超时（应略大于 summarizer 内 httpx 总超时）
 NOTES_STAGE_TIMEOUT_SEC = 360
+
+# 配图 OCR：1/true 启用（需本机 tesseract）；0/false 关闭并降级
+SUMVIDEO_OCR = os.environ.get("SUMVIDEO_OCR", "1").strip().lower() not in ("0", "false", "no")
+
+# 配图密度：compact | standard | detailed（影响 min_gap / merge_delta）
+SUMVIDEO_FRAME_DENSITY = os.environ.get("SUMVIDEO_FRAME_DENSITY", "standard").strip().lower()

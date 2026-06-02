@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -75,9 +76,27 @@ def delete_video_file(video_id: str) -> bool:
         return False
 
 
+def delete_video_frames(video_id: str) -> bool:
+    """删除 uploads/{id}/frames/ 章节配图目录。"""
+    frames_dir = _upload_dir() / video_id / "frames"
+    if not frames_dir.is_dir():
+        return False
+    try:
+        shutil.rmtree(frames_dir)
+        parent = frames_dir.parent
+        if parent.is_dir() and not any(parent.iterdir()):
+            parent.rmdir()
+        logger.info("已删除章节配图: %s", frames_dir)
+        return True
+    except OSError as e:
+        logger.warning("删除章节配图失败 %s: %s", frames_dir, e)
+        return False
+
+
 def purge_video_record(video_id: str) -> None:
     """删除 uploads 副本（若有）+ 数据库记录；不删用户原文件。"""
     delete_video_file(video_id)
+    delete_video_frames(video_id)
     delete_video(video_id)
 
 

@@ -31,20 +31,27 @@ def _parse_segments(raw) -> list:
     return []
 
 
-def video_has_resumable_transcript(video: dict) -> bool:
-    """转写已落库且文本不像错误文案时，可从笔记阶段继续。"""
+def video_has_saved_transcript(video: dict) -> bool:
+    """转写已落库（含 done 任务），可用于 notes_only 重跑笔记。"""
     segments = _parse_segments(video.get("transcript_segments"))
     if not segments:
         return False
     text = (video.get("transcript") or "").strip()
     if len(text) < 50:
         return False
+    head = text[:160]
+    if any(m in head for m in _ERROR_MARKERS):
+        return False
+    return True
+
+
+def video_has_resumable_transcript(video: dict) -> bool:
+    """转写已落库且文本不像错误文案时，可从笔记阶段继续（error 态断点续跑）。"""
+    if not video_has_saved_transcript(video):
+        return False
     if (video.get("error_message") or "").strip():
         return True
     if video.get("status") != "error":
-        return False
-    head = text[:160]
-    if any(m in head for m in _ERROR_MARKERS):
         return False
     return True
 

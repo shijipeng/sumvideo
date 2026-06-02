@@ -1,5 +1,6 @@
-import { stripNoteLabel } from '../lib/noteText'
-import { groupTranscriptBySections, mergeTranscriptSegments, formatTime } from '../lib/transcript'
+import { sectionHasBody, SectionBody } from '../lib/sectionRender'
+import { groupTranscriptBySections, formatTime } from '../lib/transcript'
+import { TranscriptSegmentRow } from './TranscriptSegmentRow'
 import type { NoteSection, TranscriptSegment } from '../types'
 
 interface Props {
@@ -11,6 +12,8 @@ interface Props {
   transcriptSegments?: TranscriptSegment[] | null
   onTranscriptSeek?: (time: number) => void
   legacySummary?: string | null
+  /** 如「编程 · 口播讲解」 */
+  metaLabel?: string | null
 }
 
 export function NotesView({
@@ -22,8 +25,11 @@ export function NotesView({
   transcriptSegments,
   onTranscriptSeek,
   legacySummary,
+  metaLabel,
 }: Props) {
-  const hasStructured = Boolean(overview || sections.some((s) => s.lead || s.points?.length))
+  const hasStructured = Boolean(
+    overview || sections.some((s) => sectionHasBody(s)),
+  )
 
   if (!hasStructured && !legacySummary && !transcript) {
     return <p className="text-sm text-[var(--sv-fg-muted)]">处理完成后显示 AI 笔记</p>
@@ -56,6 +62,9 @@ export function NotesView({
     <div className="space-y-5 text-sm leading-relaxed text-[var(--sv-fg)]">
       {overview && (
         <section>
+          {metaLabel && (
+            <p className="mb-2 text-xs text-[var(--sv-fg-muted)]">{metaLabel}</p>
+          )}
           <h3 className="mb-2 text-xs font-semibold uppercase tracking-wider text-[var(--sv-fg-muted)]">
             概述
           </h3>
@@ -149,16 +158,7 @@ function SectionList({
               </span>
             </button>
             <div className="select-text cursor-text">
-              {sec.lead && (
-                <p className="mb-1.5 text-[var(--sv-fg)]">{stripNoteLabel(sec.lead)}</p>
-              )}
-              {sec.points && sec.points.length > 0 && (
-                <ul className="mt-1 list-inside list-disc space-y-1 text-[var(--sv-fg-muted)]">
-                  {sec.points.map((p, j) => (
-                    <li key={j}>{stripNoteLabel(p)}</li>
-                  ))}
-                </ul>
-              )}
+              <SectionBody section={sec} />
             </div>
           </li>
         )
@@ -180,12 +180,7 @@ function TranscriptBlock({
 }) {
   const segments = transcriptSegments ?? []
   const hasSegments = segments.length > 0
-  const groups = hasSegments
-    ? groupTranscriptBySections(segments, sections).map((group) => ({
-        ...group,
-        items: mergeTranscriptSegments(group.items),
-      }))
-    : []
+  const groups = hasSegments ? groupTranscriptBySections(segments, sections) : []
 
   return (
     <details className="rounded-lg border border-[var(--sv-border)] bg-[var(--sv-canvas)]">
@@ -193,20 +188,20 @@ function TranscriptBlock({
         查看完整转写文本
         {hasSegments && (
           <span className="ml-2 text-xs text-[var(--sv-fg-muted)]">
-            （{sections.length ? '按章节内段落' : '按段落'}，点击跳转）
+            （{sections.length ? '按章节 · 逐句' : '逐句'}，点击跳转）
           </span>
         )}
       </summary>
 
       {hasSegments ? (
-        <div className="space-y-4 px-3 pb-3">
+        <div className="space-y-2 px-3 pb-2">
           {groups.map((group, gi) => (
             <div key={`${group.title}-${gi}`}>
               {sections.length > 0 && (
                 <button
                   type="button"
                   onClick={() => onSeek?.(group.start_time)}
-                  className="mb-2 flex items-center gap-2 text-left text-xs font-semibold text-[var(--sv-fg)] hover:text-[var(--sv-accent)]"
+                  className="mb-1 flex items-center gap-2 text-left text-xs font-semibold text-[var(--sv-fg)] hover:text-[var(--sv-accent)]"
                 >
                   <span className="font-mono text-[var(--sv-fg-muted)]">
                     {formatTime(group.start_time)}
@@ -214,21 +209,10 @@ function TranscriptBlock({
                   {group.title}
                 </button>
               )}
-              <ul className="space-y-2">
+              <ul className="space-y-0.5">
                 {group.items.map((seg, si) => (
                   <li key={`${seg.start_time}-${si}`}>
-                    <button
-                      type="button"
-                      onClick={() => onSeek?.(seg.start_time)}
-                      className="w-full rounded-md border border-transparent px-2 py-1.5 text-left hover:border-[var(--sv-border)] hover:bg-[var(--sv-canvas-subtle)]"
-                    >
-                      <span className="mr-2 font-mono text-xs text-[var(--sv-fg-muted)]">
-                        {formatTime(seg.start_time)}
-                      </span>
-                      <span className="text-xs leading-relaxed text-[var(--sv-fg-muted)]">
-                        {seg.text}
-                      </span>
-                    </button>
+                    <TranscriptSegmentRow segment={seg} onSeek={onSeek} />
                   </li>
                 ))}
               </ul>
@@ -239,7 +223,7 @@ function TranscriptBlock({
           ))}
         </div>
       ) : (
-        <pre className="whitespace-pre-wrap px-3 pb-3 text-xs leading-relaxed text-[var(--sv-fg-muted)]">
+        <pre className="whitespace-pre-wrap px-3 pb-2 text-xs leading-snug text-[var(--sv-fg-muted)]">
           {transcript}
         </pre>
       )}

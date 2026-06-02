@@ -3,6 +3,7 @@ import { HistoryPanel } from './components/HistoryPanel'
 import { ModelDownloadGate } from './components/ModelDownloadGate'
 import { MindMapView } from './components/MindMapView'
 import { NotesView } from './components/NotesView'
+import { IllustratedNotesView } from './components/IllustratedNotesView'
 import { SetupGate } from './components/SetupGate'
 import { ImportUrlField } from './components/ImportUrlField'
 import { UploadButton } from './components/UploadButton'
@@ -26,6 +27,7 @@ import { formatUnknownError } from './lib/errors'
 import { canResumeFromNotes, formatTaskError } from './lib/taskResume'
 import type { RetryFromStage } from './lib/api'
 import { buildMindmapMarkdown, canBuildMindmap } from './lib/mindmapMarkdown'
+import { sectionHasBody } from './lib/sectionRender'
 import { useTheme } from './theme/ThemeContext'
 import type { HistoryItem, NoteSection, VideoStatus } from './types'
 
@@ -153,6 +155,7 @@ function MainWorkspace({
   const [localFile, setLocalFile] = useState<File | null>(null)
   const [taskId, setTaskId] = useState<string | null>(null)
   const [polling, setPolling] = useState(false)
+  const [retryInFlight, setRetryInFlight] = useState(false)
   const [uploading, setUploading] = useState(false)
   const [importing, setImporting] = useState(false)
   const [history, setHistory] = useState<HistoryItem[]>([])
@@ -160,23 +163,44 @@ function MainWorkspace({
   const [activeSectionIndex, setActiveSectionIndex] = useState(-1)
   const [error, setError] = useState<string | null>(null)
   const [sidebarCollapsed, setSidebarCollapsed] = useState(readSidebarCollapsed)
-  const [rightTab, setRightTab] = useState<'notes' | 'mindmap'>('notes')
+  const [rightTab, setRightTab] = useState<'notes' | 'illustrated' | 'mindmap'>('notes')
   const [duplicateModal, setDuplicateModal] = useState<{
     file?: File
     url?: string
     existingId: string
     filename: string
   } | null>(null)
+  const [transcriptCorrection, setTranscriptCorrection] = useState(false)
+  const [savingCorrectionPref, setSavingCorrectionPref] = useState(false)
 
   const { status: pollStatus } = useTaskPolling(taskId, polling)
 
   const displayStatus = pollStatus ?? loadedResult
   const sections: NoteSection[] = displayStatus?.chapters ?? []
   const overview = displayStatus?.summary ?? null
-  const hasStructuredNotes = sections.some(
-    (s) => Boolean(s.lead) || Boolean(s.points && s.points.length > 0),
-  )
+  const hasStructuredNotes = sections.some((s) => sectionHasBody(s))
   const mindmapReady = canBuildMindmap(overview, sections)
+  const illustratedReady =
+    displayStatus?.status === 'done' &&
+    Boolean(displayStatus.transcript || displayStatus.transcript_segments?.length)
+
+  const notesMetaLabel = useMemo(() => {
+    const meta = displayStatus?.notes_meta
+    const typeLabel = displayStatus?.video_type_label
+    if (!meta && !typeLabel) return null
+    const parts: string[] = []
+    if (meta?.industry?.trim()) parts.push(meta.industry.trim())
+    if (typeLabel) parts.push(typeLabel)
+    const label = parts.length ? parts.join(' · ') : null
+    const bg = meta?.background_summary?.trim()
+    if (bg && label) return `${label} — ${bg.length > 60 ? `${bg.slice(0, 60)}…` : bg}`
+    return bg || label
+  }, [displayStatus?.notes_meta, displayStatus?.video_type_label])
+
+  const frameStillPolling =
+    displayStatus?.status === 'done' &&
+    (displayStatus.frame_status === 'pending' ||
+      displayStatus.frame_status === 'processing')
   const mindmapMarkdown = useMemo(
     () =>
       displayStatus
@@ -215,20 +239,33 @@ function MainWorkspace({
   }, [sidebarCollapsed])
 
   useEffect(() => {
-    if (pollStatus?.status === 'done' || pollStatus?.status === 'error') {
-      setPolling(false)
+    if (!pollStatus) return
+    if (pollStatus.status === 'processing' || pollStatus.status === 'pending') {
+      setRetryInFlight(false)
+    }
+    if (pollStatus.status === 'done') {
+      setRetryInFlight(false)
       refreshHistory()
+      setLoadedResult(pollStatus)
       if (pollStatus.status === 'done') {
-        setLoadedResult(pollStatus)
         if (localVideoUrl?.startsWith('blob:')) {
           URL.revokeObjectURL(localVideoUrl)
           setLocalVideoUrl(null)
         }
-      } else if (pollStatus.status === 'error') {
-        setError(`处理失败：${formatTaskError(pollStatus)}`)
-        console.error('[SumVideo] 处理失败', pollStatus)
-        setLoadedResult(pollStatus)
       }
+      const frameRunning =
+        pollStatus.frame_status === 'pending' ||
+        pollStatus.frame_status === 'processing'
+      if (!frameRunning) {
+        setPolling(false)
+      }
+    } else if (pollStatus.status === 'error') {
+      setRetryInFlight(false)
+      setPolling(false)
+      refreshHistory()
+      setError(`处理失败：${formatTaskError(pollStatus)}`)
+      console.error('[SumVideo] 处理失败', pollStatus)
+      setLoadedResult(pollStatus)
     }
   }, [pollStatus, refreshHistory, localVideoUrl, taskId])
 
@@ -318,7 +355,10 @@ function MainWorkspace({
     try {
       const data = await getStatus(id)
       setLoadedResult(data)
-      if (data.status === 'processing' || data.status === 'pending') {
+      const frameRunning =
+        data.status === 'done' &&
+        (data.frame_status === 'pending' || data.frame_status === 'processing')
+      if (data.status === 'processing' || data.status === 'pending' || frameRunning) {
         setPolling(true)
       } else {
         setPolling(false)
@@ -331,18 +371,34 @@ function MainWorkspace({
 
   const handleRetry = async (fromStage: RetryFromStage = 'auto') => {
     if (!taskId) return
+    if (
+      retryInFlight ||
+      pollStatus?.status === 'processing' ||
+      pollStatus?.status === 'pending' ||
+      loadedResult?.status === 'processing'
+    ) {
+      return
+    }
     setError(null)
+    setRetryInFlight(true)
     try {
       const res = await retryVideo(taskId, fromStage)
-      setPolling(true)
-      setLoadedResult(null)
+      if (fromStage === 'frames_only') {
+        setPolling(true)
+      } else {
+        setPolling(true)
+        setLoadedResult(null)
+      }
       if (res.resume_mode === 'notes_only') {
         setError(null)
       }
     } catch (e) {
+      setRetryInFlight(false)
       setError(e instanceof Error ? e.message : '重新处理失败')
     }
   }
+
+  const handleRetryFrames = () => handleRetry('frames_only')
 
   const showResumeNotes =
     displayStatus?.status === 'error' &&
@@ -376,6 +432,7 @@ function MainWorkspace({
   const progress = pollStatus?.progress ?? loadedResult?.progress ?? 0
   const progressMessage = pollStatus?.progress_message ?? ''
   const isProcessing =
+    retryInFlight ||
     pollStatus?.status === 'processing' ||
     pollStatus?.status === 'pending' ||
     loadedResult?.status === 'processing' ||
@@ -489,7 +546,7 @@ function MainWorkspace({
             </div>
           )}
 
-          {isProcessing && (
+          {isProcessing && !frameStillPolling && (
             <div className="mx-4 mt-3 shrink-0">
               <div className="mb-1 flex justify-between text-xs text-[var(--sv-fg-muted)]">
                 <span>{progressMessage || '处理中…'}</span>
@@ -511,7 +568,7 @@ function MainWorkspace({
                 src={videoSrc}
                 onTimeUpdate={handleTimeUpdate}
               />
-              {displayStatus?.status === 'done' && (
+              {displayStatus?.status === 'done' && !isProcessing && (
                 <div className="flex flex-wrap gap-2">
                   <button
                     type="button"
@@ -539,11 +596,28 @@ function MainWorkspace({
                   )}
                   <button
                     type="button"
-                    className="rounded-lg border border-[var(--sv-border)] px-3 py-1.5 text-sm text-[var(--sv-fg)] hover:bg-[var(--sv-canvas-subtle)]"
+                    className="rounded-lg border border-[var(--sv-border)] px-3 py-1.5 text-sm text-[var(--sv-fg)] hover:bg-[var(--sv-canvas-subtle)] disabled:cursor-not-allowed disabled:opacity-50"
+                    onClick={() => handleRetry('notes_only')}
+                    disabled={isProcessing}
+                  >
+                    重新生成 AI 笔记
+                  </button>
+                  <button
+                    type="button"
+                    className="rounded-lg border border-[var(--sv-border)] px-3 py-1.5 text-sm text-[var(--sv-fg)] hover:bg-[var(--sv-canvas-subtle)] disabled:cursor-not-allowed disabled:opacity-50"
+                    onClick={handleRetryFrames}
+                    disabled={frameStillPolling || isProcessing}
+                  >
+                    重新生成配图
+                  </button>
+                  <button
+                    type="button"
+                    className="rounded-lg border border-[var(--sv-border)] px-3 py-1.5 text-sm text-[var(--sv-fg)] hover:bg-[var(--sv-canvas-subtle)] disabled:cursor-not-allowed disabled:opacity-50"
                     onClick={() => {
-                      if (localFile) handleVideoSelect(localFile, true)
-                      else if (taskId) handleRetry('full')
+                      if (taskId) handleRetry('full')
+                      else if (localFile) handleVideoSelect(localFile, true)
                     }}
+                    disabled={isProcessing}
                   >
                     强制从头处理
                   </button>
@@ -562,7 +636,19 @@ function MainWorkspace({
                       : 'text-[var(--sv-fg-muted)] hover:bg-[var(--sv-canvas-subtle)]'
                   }`}
                 >
-                  笔记
+                  文字笔记
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setRightTab('illustrated')}
+                  disabled={!illustratedReady}
+                  className={`rounded-md px-3 py-1 text-sm font-medium transition disabled:cursor-not-allowed disabled:opacity-40 ${
+                    rightTab === 'illustrated'
+                      ? 'bg-[var(--sv-accent)] text-[var(--sv-accent-fg)]'
+                      : 'text-[var(--sv-fg-muted)] hover:bg-[var(--sv-canvas-subtle)]'
+                  }`}
+                >
+                  图文笔记
                 </button>
                 <button
                   type="button"
@@ -588,6 +674,23 @@ function MainWorkspace({
                     transcriptSegments={displayStatus?.transcript_segments}
                     onTranscriptSeek={(t) => playerRef.current?.seekTo(t)}
                     legacySummary={!hasStructuredNotes ? overview : null}
+                    metaLabel={notesMetaLabel}
+                  />
+                </div>
+              ) : rightTab === 'illustrated' ? (
+                <div data-notes-panel className="sv-notes-scroll p-4">
+                  <IllustratedNotesView
+                    sections={sections}
+                    activeIndex={activeSectionIndex}
+                    onSectionSelect={handleSectionSelect}
+                    transcript={displayStatus?.transcript}
+                    transcriptSegments={displayStatus?.transcript_segments}
+                    onTranscriptSeek={(t) => playerRef.current?.seekTo(t)}
+                    frameStatus={displayStatus?.frame_status}
+                    frameProgressDone={displayStatus?.frame_progress_done}
+                    frameProgressTotal={displayStatus?.frame_progress_total}
+                    frameErrorMessage={displayStatus?.frame_error_message}
+                    onRetryFrames={taskId ? handleRetryFrames : undefined}
                   />
                 </div>
               ) : (
@@ -634,7 +737,17 @@ function MainWorkspace({
                     setLocalVideoUrl(null)
                   }
                   if (url) {
-                    await handleUrlImport(url, true)
+                    setTaskId(existingId)
+                    setLoadedResult(null)
+                    setPolling(true)
+                    setError(null)
+                    try {
+                      await retryVideo(existingId, 'full')
+                      await refreshHistory()
+                    } catch (e) {
+                      setPolling(false)
+                      setError(e instanceof Error ? e.message : '重新处理失败')
+                    }
                     return
                   }
                   if (file) {
@@ -646,7 +759,7 @@ function MainWorkspace({
                   setPolling(true)
                   setError(null)
                   try {
-                    await retryVideo(existingId)
+                    await retryVideo(existingId, 'full')
                     await refreshHistory()
                   } catch (e) {
                     setPolling(false)

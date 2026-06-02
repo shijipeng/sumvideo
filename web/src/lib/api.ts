@@ -128,7 +128,7 @@ export async function getStatus(taskId: string): Promise<VideoStatus> {
   return res.json()
 }
 
-export type RetryFromStage = 'auto' | 'full' | 'notes_only'
+export type RetryFromStage = 'auto' | 'full' | 'notes_only' | 'frames_only'
 
 export async function retryVideo(
   taskId: string,
@@ -156,6 +156,18 @@ export async function deleteHistory(id: string): Promise<void> {
 
 export function videoStreamUrl(taskId: string) {
   return apiUrl(`/api/video/${taskId}`)
+}
+
+export function sectionThumbUrl(videoId: string, sectionIndex: number, frameIndex = 0) {
+  return apiUrl(`/api/video/${videoId}/thumb/${sectionIndex}/${frameIndex}`)
+}
+
+export function resolveSectionThumbUrl(thumbnail: string | null | undefined) {
+  if (!thumbnail) return null
+  if (thumbnail.startsWith('http://') || thumbnail.startsWith('https://')) {
+    return thumbnail
+  }
+  return apiUrl(thumbnail)
 }
 
 export function exportMindmapMd(filename: string, markdown: string) {

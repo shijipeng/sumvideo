@@ -4,16 +4,41 @@ export interface TranscriptSegment {
   text: string
 }
 
+export interface SectionFrame {
+  time: number
+  url: string
+}
+
 export interface NoteSection {
   title: string
   start_time: number
   end_time: number
+  format?: 'prose' | 'bullets' | 'steps' | 'qa'
   lead?: string
+  content?: string
   points?: string[]
+  steps?: string[]
+  qa?: { q: string; a: string }[]
+  /** 节内多图（按时间排序） */
+  frames?: SectionFrame[]
+  /** 首张配图，兼容旧数据 */
+  thumbnail?: string | null
 }
 
 /** @deprecated 使用 NoteSection */
 export type Chapter = NoteSection
+
+export interface NotesMeta {
+  schema_version?: number
+  video_type: string
+  summary_style?: string
+  industry?: string
+  confidence?: number
+  type_reason?: string
+  video_type_raw?: string
+  background_summary?: string
+  structure_style?: string
+}
 
 export interface VideoStatus {
   id: string
@@ -26,6 +51,12 @@ export interface VideoStatus {
   chapters?: NoteSection[] | null
   /** 概述（方案 B）；旧数据可能为整篇 Markdown */
   summary?: string | null
+  notes_meta?: NotesMeta | null
+  frame_status?: 'pending' | 'processing' | 'done' | 'error' | 'skipped'
+  frame_progress_done?: number
+  frame_progress_total?: number
+  frame_error_message?: string | null
+  video_type_label?: string | null
   /** 失败原因（与 transcript 分离，便于断点续跑） */
   error_message?: string | null
   /** 可从笔记阶段继续（转写已保存） */

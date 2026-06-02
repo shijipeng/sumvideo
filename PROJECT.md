@@ -20,7 +20,10 @@
 - **上传与处理**：支持常见视频格式；SHA256 去重；重复时可「使用已有结果」或「重新处理」
 - **在线 URL 导入**：粘贴链接 → yt-dlp 拉字幕 + 下载到 `uploads/`；有合格 CC 字幕则跳过 Whisper；URL 级查重
 - **转写**：本地 Whisper（Mac M 系 MLX / 其它平台 faster-whisper）；无在线字幕时 fallback
-- **笔记（方案 B）**：一次 LLM 调用生成 `overview` + 多段 `sections`（含 `title`、`start_time`、`lead`、`points`）
+- **笔记（方案 B）**：一次 DeepSeek 调用生成 `meta` + `overview` + 多段 `sections`（含 `title`、`start_time`、`lead`、`points`）；`meta` 含 `video_type`、`industry` 等，驱动分类型总结写法
+- **章节配图（异步事件选图）**：文字笔记完成后 `status=done` 立即可读；后台 `run_frame_stage` 按场景（镜头切换 + 转写边界 ± OCR）本地 ffmpeg 选帧，独立 `frame_status`；**0 视觉 API、不额外 DeepSeek**
+- **Partial success**：配图失败不影响文字笔记；支持 `frames_only` 仅重跑配图
+- **Tab**：文字笔记 | 图文笔记（转写 + 按时间穿插配图）| 思维导图
 - **转写句段**：`transcript_segments` 按章节分组展示，点击跳转
 - **播放**：原生 `<video>`；章节标题行跳转；方向键快进/倍速；处理完成后可流式播放 `GET /api/video/{id}`
 - **思维导图**：由笔记转 Markdown 大纲，Markmap 渲染；**不额外调用 API**；点击节点跳转对应时间
@@ -36,7 +39,7 @@
 ┌─────────────────────────────────────────────────────────────┐
 │  浏览器  http://localhost:5173                               │
 │  React · Vite · Tailwind                                    │
-│  VideoPlayer · NotesView · MindMapView · HistoryPanel         │
+│  VideoPlayer · NotesView · IllustratedNotesView · MindMapView · HistoryPanel │
 └───────────────────────────┬─────────────────────────────────┘
                             │ /api → proxy → :8000
 ┌───────────────────────────▼─────────────────────────────────┐
@@ -49,6 +52,7 @@
 │ SQLite        │              │ 处理流水线          │
 │ sumvideo.db   │              │ ffmpeg → Whisper   │
 │ uploads/      │              │ → DeepSeek 笔记    │
+│               │              │ → 异步 frame_stage │
 └───────────────┘              └──────────────────┘
 ```
 
@@ -57,8 +61,9 @@
 1. 上传 → 存 `uploads/{id}.ext`，写入 DB（`pending`）
 2. `ffmpeg` 提取 16kHz 单声道 WAV
 3. 本地 Whisper 转写 → `transcript` + `transcript_segments`
-4. DeepSeek `generate_notes()` → `summary`(overview) + `chapters`(sections)
-5. 状态 `done`，前端轮询 `/api/status/{id}` 展示结果
+4. DeepSeek `generate_notes()` → `notes_meta` + `summary`(overview) + `chapters`(sections) → **`status=done`**
+5. 若有本地视频：后台 `run_frame_stage` → `frame_status` 从 `pending` → `processing` → `done|error`；前端在 `done` 后仍轮询直至配图结束
+6. 配图写入 `sections[].frames[]`（及兼容 `thumbnail`），存储于 `uploads/{id}/frames/{sec}_{idx}.jpg`
 
 **在线 URL 导入流程**
 
@@ -88,7 +93,13 @@ sumvideo/
 │   │   ├── transcriber.py  # ffmpeg + MLX / faster-whisper
 │   │   ├── url_importer.py # 在线 URL 校验、probe、下载
 │   │   ├── subtitle_fetcher.py # yt-dlp 字幕拉取与解析
-│   │   ├── summarizer.py   # DeepSeek 结构化笔记
+│   │   ├── summarizer.py   # DeepSeek 结构化笔记 + meta
+│   │   ├── scenarios.py    # 视频类型 registry 与 FrameProfile
+│   │   ├── frame_pipeline.py  # 事件驱动选图（scene/transcript/OCR）
+│   │   ├── frame_stage.py  # 异步配图阶段
+│   │   ├── frame_ocr.py    # 可选 OCR 事件源
+│   │   ├── transcript_merge.py
+│   │   ├── frame_extractor.py  # ffmpeg 截帧与缩略图路径
 │   │   ├── whisper_models.py
 │   │   ├── settings_store.py
 │   │   ├── model_download.py
@@ -282,11 +293,13 @@ npm run frontend  # http://localhost:5173
 | DELETE | `/api/settings` | 清除配置 |
 | POST | `/api/upload?force=false` | 上传；`force=true` 替换同哈希旧任务 |
 | POST | `/api/import-url` | 在线 URL 导入；`force=true` 替换同 URL 旧任务 |
-| GET | `/api/status/{id}` | 进度与结果 |
+| GET | `/api/status/{id}` | 进度与结果（含 `notes_meta`、`frame_status`） |
 | GET | `/api/video/{id}` | 视频流（处理后仍保留在 uploads） |
+| GET | `/api/video/{id}/thumb/{section}/{frame}` | 章节配图 JPEG（多图） |
+| GET | `/api/video/{id}/thumb/{index}` | 章节配图 JPEG（兼容旧版） |
 | GET | `/api/history` | 历史（按 file_hash 去重展示） |
 | DELETE | `/api/history/{id}` | 删除记录与文件 |
-| POST | `/api/retry/{id}` | 在原任务上重新转写+总结 |
+| POST | `/api/retry/{id}?from_stage=` | 重试：`auto`/`full`/`notes_only`/`frames_only` |
 | POST | `/api/models/download` | 触发 Whisper 模型下载 |
 | GET | `/api/models/download/status` | 下载进度 |
 
@@ -309,7 +322,7 @@ npm run frontend  # http://localhost:5173
 | 场景 | 行为 |
 |------|------|
 | 处理失败（转写/笔记报错） | 立即删视频，DB 保留 error 供查看/删历史 |
-| 用户删除历史 | 删视频 + 删 DB 记录 |
+| 用户删除历史 | 删视频 + 删章节配图 + 删 DB 记录 |
 | 同文件哈希重复任务 | 只保留最新一条，旧任务记录与文件一并删 |
 | 强制重传 `force=true` | 上传前删掉同哈希旧任务与文件 |
 | 僵尸任务（pending/processing 超过 48h） | 标为 error 并删视频（`config.STALE_TASK_HOURS`） |
@@ -348,11 +361,14 @@ npm run frontend  # http://localhost:5173
 | 处理主流程 | `backend/app.py` → `process_video` |
 | 转写 | `backend/core/transcriber.py` |
 | 笔记生成 | `backend/core/summarizer.py` |
+| 场景 registry | `backend/core/scenarios.py` |
+| 异步配图 | `backend/core/frame_stage.py` + `frame_pipeline.py` |
 | 数据库 / 去重 | `backend/db/database.py` |
 | 视频文件清理 | `backend/core/storage_cleanup.py` |
 | 主界面 | `web/src/App.tsx` |
 | 播放器 | `web/src/components/VideoPlayer.tsx` |
 | 笔记 UI | `web/src/components/NotesView.tsx` |
+| 图文笔记 | `web/src/components/IllustratedNotesView.tsx` |
 | 思维导图 | `web/src/components/MindMapView.tsx` |
 | 导图 Markdown | `web/src/lib/mindmapMarkdown.ts` |
 | API 客户端 | `web/src/lib/api.ts` |
@@ -365,3 +381,11 @@ npm run frontend  # http://localhost:5173
 问题修复与小改进可继续基于本文档中的架构边界进行。
 
 *文档随仓库代码更新；若与实现不一致，以代码为准。*
+
+### 新增视频场景 Checklist
+
+1. 在 `backend/core/scenarios.py` 的 `SCENARIOS` 增加 `ScenarioDefinition`（`id`、`label`、`FrameProfile`、`summary_hints`）
+2. 将 `id` 加入 `VALID_VIDEO_TYPES`
+3. `list_scenarios_for_prompt()` 会自动纳入 DeepSeek 枚举，无需改 pipeline 硬编码
+4. 按需调整 `FrameProfile.event_sources`（如录屏开 `ocr`、vlog 开 `section_cap`）
+5. 用样片验收：`lecture_screen` / `talking_head` / `vlog_dynamic` 各 1 条
